@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"io"
 	"testing"
 )
@@ -24,16 +23,22 @@ func TestRunRejectsUnknownMode(t *testing.T) {
 	}
 }
 
-// TestRunDownloadNotImplemented locks in the placeholder behaviour for
-// the download mode so the real implementation in a later commit has to
-// consciously replace it.
-func TestRunDownloadNotImplemented(t *testing.T) {
+// TestRunRejectsBadInterval pins the config wiring for download mode:
+// an out-of-range --interval must surface from LoadConfig rather than
+// reaching the Downloader. The unit tests on Downloader assume a valid
+// interval; this confirms the boundary.
+func TestRunRejectsBadInterval(t *testing.T) {
 	err := run(
 		context.Background(),
-		[]string{"--mode", "download", "--path", "/tmp/acme.json", "--bucket", "b"},
+		[]string{
+			"--mode", "download",
+			"--path", "/tmp/acme.json",
+			"--bucket", "b",
+			"--interval", "1s",
+		},
 		nil, io.Discard, io.Discard,
 	)
-	if !errors.Is(err, errNotImplemented) {
-		t.Fatalf("download: got %v, want errNotImplemented", err)
+	if err == nil {
+		t.Fatal("expected error for sub-minimum interval, got nil")
 	}
 }

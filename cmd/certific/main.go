@@ -6,7 +6,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -27,11 +26,6 @@ func main() {
 	}
 }
 
-// errNotImplemented is returned by mode dispatch arms that haven't landed
-// yet. It lets the skeleton be exercised end-to-end (flags parse, mode
-// dispatches) without pretending the binary is functional.
-var errNotImplemented = errors.New("not implemented")
-
 // run is the testable entry point. It parses args, dispatches to a mode,
 // and returns any error so main can decide the exit code.
 func run(ctx context.Context, args []string, environ []string, stdout, stderr io.Writer) error {
@@ -48,7 +42,7 @@ func run(ctx context.Context, args []string, environ []string, stdout, stderr io
 	case certific.ModeUpload:
 		return runUpload(ctx, cfg, logger)
 	case certific.ModeDownload:
-		return runDownload(ctx)
+		return runDownload(ctx, cfg, logger)
 	default:
 		// LoadConfig already rejected unknown/empty mode, so this is
 		// unreachable in practice — kept as a defensive guard.
@@ -70,6 +64,17 @@ func runUpload(ctx context.Context, cfg certific.Config, logger *slog.Logger) er
 	return u.Run(ctx)
 }
 
-func runDownload(_ context.Context) error {
-	return fmt.Errorf("download: %w", errNotImplemented)
+func runDownload(ctx context.Context, cfg certific.Config, logger *slog.Logger) error {
+	store, err := certific.NewS3Store(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	d := &certific.Downloader{
+		Store:    store,
+		Path:     cfg.Path,
+		Key:      cfg.Key,
+		Interval: cfg.Interval,
+		Logger:   logger,
+	}
+	return d.Run(ctx)
 }
