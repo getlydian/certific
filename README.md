@@ -159,6 +159,25 @@ AWS credentials are read by the standard AWS SDK chain
 shared config files, IMDS, etc.) — `certific` doesn't take credential
 flags.
 
+Every env var ending in `_FILE` is resolved at startup: the file at
+that path is read and its trimmed contents become the value of the
+same name without the suffix (Docker/Swarm secret convention — same
+as Postgres and Traefik images). Use this to feed AWS credentials from
+mounted Swarm secrets:
+
+```yaml
+environment:
+  - AWS_ACCESS_KEY_ID_FILE=/run/secrets/aws_access_key_id
+  - AWS_SECRET_ACCESS_KEY_FILE=/run/secrets/aws_secret_access_key
+secrets:
+  - aws_access_key_id
+  - aws_secret_access_key
+```
+
+A plain env var wins over the file form if both are set (handy for
+local debugging). An unreadable `_FILE` path is fatal — failing loudly
+beats falling through to anonymous SDK calls.
+
 ### Health endpoint
 
 When `--health-addr` is set, the binary exposes:

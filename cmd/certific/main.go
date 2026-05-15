@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,10 +23,60 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Resolve `*_FILE` env vars into their plain-named counterparts
+	// before anything else reads the environment. This is the standard
+	// Docker secret-mounting pattern (Postgres, MySQL, Traefik, etc.):
+	// mount the secret as a file under /run/secrets and point a
+	// `FOO_FILE=/run/secrets/foo` env var at it. Critical for AWS
+	// credentials, which the SDK only reads from `AWS_ACCESS_KEY_ID` /
+	// `AWS_SECRET_ACCESS_KEY` directly, not from file paths.
+	if err := resolveFileEnv(os.Environ(), os.Setenv); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
 	if err := run(ctx, os.Args[1:], os.Environ(), os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// resolveFileEnv reads every `FOO_FILE=path` from environ and, for each
+// one where `FOO` is not already set, calls setenv("FOO", contents). The
+// trailing newline of secret files (most editors add one, swarm doesn't,
+// but operators copy-pasting through `bin/secrets-edit` often do) is
+// stripped so `cat secretfile | tr -d '\n'` isn't required at every
+// callsite. A `FOO_FILE` whose path is unreadable is fatal — failing
+// loudly beats starting up with a half-populated credential chain.
+func resolveFileEnv(environ []string, setenv func(string, string) error) error {
+	for _, kv := range environ {
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		key, path := kv[:eq], kv[eq+1:]
+		if !strings.HasSuffix(key, "_FILE") || path == "" {
+			continue
+		}
+		target := strings.TrimSuffix(key, "_FILE")
+		if target == "" {
+			continue
+		}
+		if _, set := os.LookupEnv(target); set {
+			// Existing value wins so an operator can override a
+			// mounted secret with a plain env var for local debugging
+			// without un-mounting the file.
+			continue
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read %s=%s: %w", key, path, err)
+		}
+		if err := setenv(target, strings.TrimRight(string(body), "\r\n")); err != nil {
+			return fmt.Errorf("set %s: %w", target, err)
+		}
+	}
+	return nil
 }
 
 // run is the testable entry point. It parses args, dispatches to a mode,
