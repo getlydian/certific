@@ -169,7 +169,7 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("get: %w", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	buf, err := io.ReadAll(body)
 	if err != nil {

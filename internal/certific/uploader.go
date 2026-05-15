@@ -121,7 +121,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fsnotify new watcher: %w", err)
 	}
-	defer watcher.Close()
+	defer func() { _ = watcher.Close() }()
 
 	// Watch the parent directory: atomic writers (Traefik included) rename
 	// a tempfile into place, which destroys the original inode the watcher
@@ -226,7 +226,7 @@ func (u *Uploader) bootstrap(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("bootstrap get: %w", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	buf, err := io.ReadAll(body)
 	if err != nil {
 		return fmt.Errorf("bootstrap read body: %w", err)
@@ -337,12 +337,12 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	tmpName := tmp.Name()
 	cleanup := func() { _ = os.Remove(tmpName) }
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		cleanup()
 		return err
 	}
 	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		cleanup()
 		return err
 	}

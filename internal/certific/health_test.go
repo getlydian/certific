@@ -157,7 +157,7 @@ func TestRunHealthServerServesAndShutsDown(t *testing.T) {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	cancel()
 	select {
@@ -185,7 +185,7 @@ func TestRunHealthServerReportsBindError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pre-listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	syncer := LastSyncerFunc(func() time.Time { return time.Now() })
 	err = RunHealthServer(context.Background(), addr, syncer, time.Minute, nil)
