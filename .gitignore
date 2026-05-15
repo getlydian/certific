@@ -1,0 +1,14 @@
+# Binaries
+/certific
+/cmd/certific/certific
+
+# Go test/coverage artifacts
+*.test
+*.out
+
+# Build output
+/dist/
+
+# Editor / IDE
+/.idea/
+/.vscode/
