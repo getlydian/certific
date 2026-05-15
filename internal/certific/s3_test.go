@@ -24,8 +24,9 @@ import (
 // because the uploader's debounce timer can fire from one goroutine while
 // tests poke another.
 type fakeStore struct {
-	mu      sync.Mutex
-	objects map[string]fakeObject
+	mu       sync.Mutex
+	objects  map[string]fakeObject
+	putCalls int
 }
 
 type fakeObject struct {
@@ -58,12 +59,22 @@ func (f *fakeStore) Put(_ context.Context, key string, body io.Reader, contentLe
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.putCalls++
 	f.objects[key] = fakeObject{
 		body:         buf,
 		etag:         fmt.Sprintf("%q", md5sum(buf)),
 		lastModified: time.Now().UTC(),
 	}
 	return nil
+}
+
+// resetCounts clears observable counters but leaves stored objects in
+// place. Uploader tests use it to ignore Puts that happen during the
+// bootstrap/initial-upload settle window.
+func (f *fakeStore) resetCounts() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.putCalls = 0
 }
 
 func (f *fakeStore) Head(_ context.Context, key string) (string, time.Time, error) {

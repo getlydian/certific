@@ -7,12 +7,14 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/getlydian/certific/internal/certific"
 )
 
 func main() {
@@ -25,39 +27,47 @@ func main() {
 	}
 }
 
-// errNotImplemented is returned by both mode dispatch arms until the real
-// upload/download implementations land in later commits. It lets the
-// skeleton be exercised end-to-end (flags parse, mode dispatches) without
-// pretending the binary is functional.
+// errNotImplemented is returned by mode dispatch arms that haven't landed
+// yet. It lets the skeleton be exercised end-to-end (flags parse, mode
+// dispatches) without pretending the binary is functional.
 var errNotImplemented = errors.New("not implemented")
 
 // run is the testable entry point. It parses args, dispatches to a mode,
 // and returns any error so main can decide the exit code.
 func run(ctx context.Context, args []string, environ []string, stdout, stderr io.Writer) error {
-	_ = environ // consumed by the config loader in a later commit
 	_ = stdout
 
-	fs := flag.NewFlagSet("certific", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	mode := fs.String("mode", "", "run mode: upload|download")
-	if err := fs.Parse(args); err != nil {
+	cfg, err := certific.LoadConfig(args, environ, stderr)
+	if err != nil {
 		return err
 	}
 
-	switch *mode {
-	case "upload":
-		return runUpload(ctx)
-	case "download":
+	logger := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
+
+	switch cfg.Mode {
+	case certific.ModeUpload:
+		return runUpload(ctx, cfg, logger)
+	case certific.ModeDownload:
 		return runDownload(ctx)
-	case "":
-		return fmt.Errorf("--mode is required (upload|download)")
 	default:
-		return fmt.Errorf("unknown mode %q (want upload|download)", *mode)
+		// LoadConfig already rejected unknown/empty mode, so this is
+		// unreachable in practice — kept as a defensive guard.
+		return fmt.Errorf("unknown mode %q", cfg.Mode)
 	}
 }
 
-func runUpload(_ context.Context) error {
-	return fmt.Errorf("upload: %w", errNotImplemented)
+func runUpload(ctx context.Context, cfg certific.Config, logger *slog.Logger) error {
+	store, err := certific.NewS3Store(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("upload: %w", err)
+	}
+	u := &certific.Uploader{
+		Store:  store,
+		Path:   cfg.Path,
+		Key:    cfg.Key,
+		Logger: logger,
+	}
+	return u.Run(ctx)
 }
 
 func runDownload(_ context.Context) error {

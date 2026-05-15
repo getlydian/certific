@@ -24,17 +24,15 @@ func TestRunRejectsUnknownMode(t *testing.T) {
 	}
 }
 
-// TestRunUploadNotImplemented locks in the placeholder behaviour so the
-// real implementation in a later commit has to consciously replace it.
-func TestRunUploadNotImplemented(t *testing.T) {
-	err := run(context.Background(), []string{"--mode", "upload"}, nil, io.Discard, io.Discard)
-	if !errors.Is(err, errNotImplemented) {
-		t.Fatalf("upload: got %v, want errNotImplemented", err)
-	}
-}
-
+// TestRunDownloadNotImplemented locks in the placeholder behaviour for
+// the download mode so the real implementation in a later commit has to
+// consciously replace it.
 func TestRunDownloadNotImplemented(t *testing.T) {
-	err := run(context.Background(), []string{"--mode", "download"}, nil, io.Discard, io.Discard)
+	err := run(
+		context.Background(),
+		[]string{"--mode", "download", "--path", "/tmp/acme.json", "--bucket", "b"},
+		nil, io.Discard, io.Discard,
+	)
 	if !errors.Is(err, errNotImplemented) {
 		t.Fatalf("download: got %v, want errNotImplemented", err)
 	}
