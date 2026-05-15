@@ -1,0 +1,23 @@
+.git
+.gitignore
+.github
+.idea
+.vscode
+.claude
+
+# Markdown — keep README, drop the rest (design notes, plans, changelogs)
+*.md
+!README.md
+
+# Test artifacts
+*.test
+*.out
+
+# Local build output
+dist/
+certific
+cmd/certific/certific
+
+# Docker
+Dockerfile
+.dockerignore
