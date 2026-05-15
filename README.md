@@ -129,8 +129,9 @@ volume on the same node. The gateway-side `traefik` and `certific
 download` share the per-node `acme-gateway` volume (one volume per
 gateway node — they don't share state between gateways).
 
-A worked compose example landing in `examples/swarm/` covers the full
-shape (networks, secrets, both Traefik configs).
+A worked compose example lives at
+[examples/swarm/compose.yml](examples/swarm/compose.yml) and covers the
+full shape (networks, secrets, both Traefik configs).
 
 ## Configuration
 

@@ -1,0 +1,151 @@
+# Example Docker Swarm stack wiring `certific` to a pair of Traefiks.
+#
+# Shape:
+#   - One `traefik-issuer` (replicas: 1) co-pinned with one `certific-upload`
+#     on a node carrying `role=issuer`. They share the `acme-issuer` volume,
+#     so both must land on the same node.
+#   - One `traefik` and one `certific-download` per gateway node, both
+#     `mode: global` and constrained to `role=gateway`. They share the
+#     per-node `acme-gateway` volume (one volume per gateway, not shared
+#     between gateways).
+#
+# Replace the placeholders before deploying:
+#   - `example-acme` with your bucket name.
+#   - The two AWS credential secrets with real values scoped to one object.
+#     `acme-issuer-aws` needs GetObject + PutObject; `acme-gateway-aws`
+#     needs GetObject only.
+#   - Your DNS provider's credentials, wired into the issuer service per
+#     that provider's documentation (omitted here on purpose — `certific`
+#     itself is provider-agnostic).
+#
+# Bring up with:
+#   docker stack deploy -c examples/swarm/compose.yml certific-example
+
+services:
+  traefik-issuer:
+    image: traefik:v3.6
+    networks:
+      - socket
+    volumes:
+      - acme-issuer:/etc/acme
+    command:
+      - "--providers.swarm.endpoint=http://docker-socket-proxy:2375"
+      - "--providers.swarm.exposedbydefault=false"
+      - "--certificatesResolvers.dns.acme.email=you@example.com"
+      - "--certificatesResolvers.dns.acme.storage=/etc/acme/acme.json"
+      - "--certificatesResolvers.dns.acme.dnsChallenge=true"
+      # Wire your DNS provider here. The issuer is the only place that
+      # needs provider credentials.
+      - "--certificatesResolvers.dns.acme.dnsChallenge.provider=YOUR_PROVIDER"
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.role == issuer]
+
+  certific-upload:
+    image: ghcr.io/getlydian/certific:latest
+    networks:
+      - socket
+    volumes:
+      - acme-issuer:/etc/acme
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID_FILE=/run/secrets/acme-issuer-aws-key-id
+      - AWS_SECRET_ACCESS_KEY_FILE=/run/secrets/acme-issuer-aws-secret
+    secrets:
+      - acme-issuer-aws-key-id
+      - acme-issuer-aws-secret
+    command:
+      - "--mode=upload"
+      - "--path=/etc/acme/acme.json"
+      - "--bucket=example-acme"
+      - "--key=acme.json"
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.labels.role == issuer]
+
+  traefik:
+    image: traefik:v3.6
+    networks:
+      - public
+      - socket
+    ports:
+      - { target: 80, published: 80, protocol: tcp, mode: host }
+      - { target: 443, published: 443, protocol: tcp, mode: host }
+    volumes:
+      - acme-gateway:/etc/acme
+    command:
+      - "--entrypoints.http.address=:80"
+      - "--entrypoints.https.address=:443"
+      - "--providers.swarm.endpoint=http://docker-socket-proxy:2375"
+      - "--providers.swarm.exposedbydefault=false"
+      - "--providers.swarm.network=certific-example_public"
+      # Gateways read acme.json as a cache only; no resolver is configured
+      # here, so no gateway can ever start an ACME flow.
+    deploy:
+      mode: global
+      placement:
+        constraints: [node.labels.role == gateway]
+
+  certific-download:
+    image: ghcr.io/getlydian/certific:latest
+    volumes:
+      - acme-gateway:/etc/acme
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID_FILE=/run/secrets/acme-gateway-aws-key-id
+      - AWS_SECRET_ACCESS_KEY_FILE=/run/secrets/acme-gateway-aws-secret
+    secrets:
+      - acme-gateway-aws-key-id
+      - acme-gateway-aws-secret
+    command:
+      - "--mode=download"
+      - "--path=/etc/acme/acme.json"
+      - "--bucket=example-acme"
+      - "--key=acme.json"
+      - "--interval=60s"
+    deploy:
+      mode: global
+      placement:
+        constraints: [node.labels.role == gateway]
+
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - socket
+    environment:
+      - CONTAINERS=1
+      - NETWORKS=1
+      - NODES=1
+      - SERVICES=1
+      - SWARM=1
+      - TASKS=1
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+
+networks:
+  public:
+    driver: overlay
+    attachable: true
+  socket:
+    driver: overlay
+
+volumes:
+  acme-issuer:
+  acme-gateway:
+
+secrets:
+  acme-issuer-aws-key-id:
+    external: true
+  acme-issuer-aws-secret:
+    external: true
+  acme-gateway-aws-key-id:
+    external: true
+  acme-gateway-aws-secret:
+    external: true
