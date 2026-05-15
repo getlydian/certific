@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -45,6 +46,28 @@ type Uploader struct {
 	// reads or writes these, so no lock is needed.
 	lastHash [sha256.Size]byte
 	hasHash  bool
+
+	// lastSyncUnixNano is the unix-nano timestamp of the most recent
+	// successful S3 operation (Put or bootstrap Get, including the
+	// 404-tolerated case). Read concurrently by the health endpoint;
+	// stored as atomic.Int64 so we don't need a mutex on the hot path.
+	lastSyncUnixNano atomic.Int64
+}
+
+// LastSync returns the time of the most recent successful S3 interaction
+// (Put or bootstrap). The zero value means "nothing successful yet" —
+// used by the health endpoint to decide /healthz status. Safe to call
+// from any goroutine.
+func (u *Uploader) LastSync() time.Time {
+	n := u.lastSyncUnixNano.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
+func (u *Uploader) markSync(t time.Time) {
+	u.lastSyncUnixNano.Store(t.UnixNano())
 }
 
 // BackoffConfig controls Put retry pacing. Exposed so tests can drop the
@@ -193,6 +216,11 @@ func (u *Uploader) bootstrap(ctx context.Context) error {
 		// written a Path locally, the initial-upload pass after the
 		// watcher is up should push it to S3 (it's the source of
 		// truth — S3 is empty).
+		//
+		// A 404 still counts as a successful round-trip to S3 — the
+		// service is reachable, the bucket exists, the credentials
+		// work — so the health endpoint should not report stale.
+		u.markSync(time.Now())
 		return nil
 	}
 	if err != nil {
@@ -208,6 +236,7 @@ func (u *Uploader) bootstrap(ctx context.Context) error {
 	}
 	u.lastHash = sha256.Sum256(buf)
 	u.hasHash = true
+	u.markSync(time.Now())
 	u.Logger.Info("bootstrap: seeded local file from S3", "key", u.Key, "etag", etag, "bytes", len(buf))
 	return nil
 }
@@ -228,6 +257,11 @@ func (u *Uploader) uploadWithRetry(ctx context.Context, backoff BackoffConfig) {
 	}
 	hash := sha256.Sum256(buf)
 	if u.hasHash && hash == u.lastHash {
+		// Content unchanged is still a healthy state — we read the file,
+		// confirmed it matches what's in S3. Refresh lastSync so the
+		// health endpoint stays green during long periods of cert
+		// stability.
+		u.markSync(time.Now())
 		u.Logger.Debug("upload: content unchanged, skipping", "path", u.Path)
 		return
 	}
@@ -248,6 +282,7 @@ func (u *Uploader) uploadWithRetry(ctx context.Context, backoff BackoffConfig) {
 		}
 		u.lastHash = hash
 		u.hasHash = true
+		u.markSync(time.Now())
 		u.Logger.Info("upload ok", "key", u.Key, "bytes", len(buf), "attempt", attempt)
 		return
 	}

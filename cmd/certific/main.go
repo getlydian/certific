@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/getlydian/certific/internal/certific"
 )
@@ -61,7 +63,7 @@ func runUpload(ctx context.Context, cfg certific.Config, logger *slog.Logger) er
 		Key:    cfg.Key,
 		Logger: logger,
 	}
-	return u.Run(ctx)
+	return withHealth(ctx, cfg, u, cfg.HealthGrace, logger, u.Run)
 }
 
 func runDownload(ctx context.Context, cfg certific.Config, logger *slog.Logger) error {
@@ -76,5 +78,55 @@ func runDownload(ctx context.Context, cfg certific.Config, logger *slog.Logger) 
 		Interval: cfg.Interval,
 		Logger:   logger,
 	}
-	return d.Run(ctx)
+	// Downloader's freshness budget is 2×interval: one interval to
+	// notice the change, one to recover from a single failed cycle.
+	return withHealth(ctx, cfg, d, 2*cfg.Interval, logger, d.Run)
+}
+
+// withHealth optionally spins up the health server alongside the main
+// worker. If HealthAddr is empty the worker runs unchanged. Otherwise
+// the two goroutines share ctx — cancelling either tears down the
+// whole process — and the worker's error wins (the health server's
+// shutdown is best-effort).
+func withHealth(
+	ctx context.Context,
+	cfg certific.Config,
+	syncer certific.LastSyncer,
+	freshness time.Duration,
+	logger *slog.Logger,
+	worker func(context.Context) error,
+) error {
+	if cfg.HealthAddr == "" {
+		return worker(ctx)
+	}
+
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg        sync.WaitGroup
+		healthErr error
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Cancel the worker if the health server returns first (port
+		// bind failure, unexpected Serve error) so we don't keep
+		// running blind. Successful shutdown via ctx returns nil and
+		// doesn't trigger the cancel — workerCtx is already cancelled.
+		healthErr = certific.RunHealthServer(workerCtx, cfg.HealthAddr, syncer, freshness, logger)
+		cancel()
+	}()
+
+	workerErr := worker(workerCtx)
+	cancel()
+	wg.Wait()
+
+	// Worker errors are the operationally interesting ones; surface a
+	// health-server bind error only if the worker didn't have its own
+	// complaint.
+	if workerErr != nil {
+		return workerErr
+	}
+	return healthErr
 }

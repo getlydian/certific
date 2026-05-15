@@ -32,18 +32,27 @@ const (
 	MaxInterval = time.Hour
 )
 
+// DefaultHealthGrace is the staleness window applied to the upload-mode
+// health endpoint. Upload is event-driven — a healthy uploader with no
+// cert renewals does no S3 work — so the freshness budget has to be
+// generous enough to span a quiet day. Operators who want a tighter
+// signal can shrink it via --health-grace.
+const DefaultHealthGrace = 24 * time.Hour
+
 // Config is the resolved configuration for a single run. Fields are
 // populated by LoadConfig from flags, environment variables, and
 // defaults, in that precedence.
 type Config struct {
-	Mode     Mode
-	Path     string
-	Bucket   string
-	Key      string
-	Region   string
-	Endpoint string
-	Interval time.Duration
-	LogLevel slog.Level
+	Mode        Mode
+	Path        string
+	Bucket      string
+	Key         string
+	Region      string
+	Endpoint    string
+	Interval    time.Duration
+	LogLevel    slog.Level
+	HealthAddr  string        // empty → health server disabled
+	HealthGrace time.Duration // upload-mode staleness window; download mode uses 2×Interval
 }
 
 // LoadConfig resolves configuration from args and environ. Resolution
@@ -56,16 +65,20 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 	env := envMap(environ)
 
 	cfg := Config{
-		Mode:     Mode(envOr(env, "CERTIFIC_MODE", "")),
-		Path:     envOr(env, "CERTIFIC_PATH", ""),
-		Bucket:   envOr(env, "CERTIFIC_BUCKET", ""),
-		Key:      envOr(env, "CERTIFIC_KEY", "acme.json"),
-		Region:   envOr(env, "CERTIFIC_REGION", ""),
-		Endpoint: envOr(env, "CERTIFIC_ENDPOINT", ""),
+		Mode:       Mode(envOr(env, "CERTIFIC_MODE", "")),
+		Path:       envOr(env, "CERTIFIC_PATH", ""),
+		Bucket:     envOr(env, "CERTIFIC_BUCKET", ""),
+		Key:        envOr(env, "CERTIFIC_KEY", "acme.json"),
+		Region:     envOr(env, "CERTIFIC_REGION", ""),
+		Endpoint:   envOr(env, "CERTIFIC_ENDPOINT", ""),
+		HealthAddr: envOr(env, "CERTIFIC_HEALTH_ADDR", ""),
 	}
 
 	var err error
 	if cfg.Interval, err = envDuration(env, "CERTIFIC_INTERVAL", DefaultInterval); err != nil {
+		return Config{}, err
+	}
+	if cfg.HealthGrace, err = envDuration(env, "CERTIFIC_HEALTH_GRACE", DefaultHealthGrace); err != nil {
 		return Config{}, err
 	}
 	if cfg.LogLevel, err = envLogLevel(env, "CERTIFIC_LOG_LEVEL", slog.LevelInfo); err != nil {
@@ -86,6 +99,8 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 	// vs. inherited from env/default — needed because --interval only
 	// applies to download mode and we want to reject it on upload.
 	intervalFlag := fs.String("interval", "", "download poll interval, 10s ≤ x ≤ 1h (CERTIFIC_INTERVAL)")
+	fs.StringVar(&cfg.HealthAddr, "health-addr", cfg.HealthAddr, "listen address for /healthz and /metrics (e.g. :8080); empty = disabled (CERTIFIC_HEALTH_ADDR)")
+	healthGraceFlag := fs.String("health-grace", "", "upload-mode staleness window for /healthz (CERTIFIC_HEALTH_GRACE, default 24h); ignored in download mode (uses 2×--interval)")
 	fs.StringVar(&logStr, "log-level", logStr, "log level: debug|info|warn|error (CERTIFIC_LOG_LEVEL)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -102,22 +117,31 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 		cfg.Interval = d
 	}
 
+	healthGraceFromFlag := *healthGraceFlag != ""
+	if healthGraceFromFlag {
+		d, err := time.ParseDuration(*healthGraceFlag)
+		if err != nil {
+			return Config{}, fmt.Errorf("--health-grace: %w", err)
+		}
+		cfg.HealthGrace = d
+	}
+
 	if err := parseLogLevel(logStr, &cfg.LogLevel); err != nil {
 		return Config{}, err
 	}
 
-	if err := cfg.validate(intervalFromFlag); err != nil {
+	if err := cfg.validate(intervalFromFlag, healthGraceFromFlag); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
 // validate enforces the mode-specific required-field rules and the
-// "don't set download-only flags on upload" rule. intervalFromFlag
-// reports whether --interval was provided on the command line, since
-// env vs. flag have different rejection semantics (env is ignored for
-// non-applicable modes; flags are rejected).
-func (c *Config) validate(intervalFromFlag bool) error {
+// "don't set download-only flags on upload" rule. intervalFromFlag and
+// healthGraceFromFlag report whether each flag was provided on the
+// command line, since env vs. flag have different rejection semantics
+// (env is ignored for non-applicable modes; flags are rejected).
+func (c *Config) validate(intervalFromFlag, healthGraceFromFlag bool) error {
 	switch c.Mode {
 	case "":
 		return fmt.Errorf("--mode is required (upload|download)")
@@ -148,10 +172,20 @@ func (c *Config) validate(intervalFromFlag bool) error {
 		if c.Interval < MinInterval || c.Interval > MaxInterval {
 			return fmt.Errorf("--interval %s out of range [%s, %s]", c.Interval, MinInterval, MaxInterval)
 		}
+		// HealthGrace is upload-only — reject the flag on download to keep
+		// misconfigurations loud, but ignore an inherited env value (the
+		// same env may be shared with an uploader sidecar).
+		if healthGraceFromFlag {
+			return fmt.Errorf("--health-grace is only valid in upload mode (download uses 2×--interval)")
+		}
+		c.HealthGrace = 0
 	} else {
 		// Upload mode doesn't use Interval; zero it so accidental reads
 		// downstream produce an obvious "0s" rather than a stale default.
 		c.Interval = 0
+		if c.HealthGrace <= 0 {
+			return fmt.Errorf("--health-grace must be > 0, got %s", c.HealthGrace)
+		}
 	}
 
 	return nil

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"time"
 )
 
@@ -47,6 +48,29 @@ type Downloader struct {
 	// force a Get on the first successful Head even if Head and a
 	// previous Get on another process happen to agree.
 	lastEtag string
+
+	// lastSyncUnixNano is the unix-nano timestamp of the most recent
+	// successful cycle (Head returning a result, including "etag
+	// unchanged" and ErrNotFound). Read concurrently by the health
+	// endpoint; stored as atomic.Int64 to avoid a mutex on the hot path.
+	lastSyncUnixNano atomic.Int64
+}
+
+// LastSync returns the time of the most recent successful poll cycle.
+// "Successful" includes etag-unchanged skips and 404 responses — both
+// confirm S3 is reachable. The zero value means "nothing successful
+// yet"; used by the health endpoint to decide /healthz status. Safe to
+// call from any goroutine.
+func (d *Downloader) LastSync() time.Time {
+	n := d.lastSyncUnixNano.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
+func (d *Downloader) markSync(t time.Time) {
+	d.lastSyncUnixNano.Store(t.UnixNano())
 }
 
 // Run blocks until ctx is cancelled. Transient S3 errors are logged and
@@ -102,7 +126,10 @@ func (d *Downloader) cycle(ctx context.Context, backoff BackoffConfig) {
 			return
 		}
 		if errors.Is(err, errSkipped) {
-			// Etag unchanged — common case, debug-level only.
+			// Etag unchanged — common case, debug-level only. Still a
+			// successful Head; refresh lastSync so /healthz reflects
+			// reachability not staleness.
+			d.markSync(time.Now())
 			d.Logger.Debug("download: etag unchanged, skipping", "key", d.Key, "etag", d.lastEtag)
 			return
 		}
@@ -110,7 +137,9 @@ func (d *Downloader) cycle(ctx context.Context, backoff BackoffConfig) {
 			// First-deploy: writer hasn't uploaded yet. Not an error
 			// state in the operational sense; we'll check again next
 			// cycle. Log at info so it's visible during bring-up but
-			// doesn't trip warning-level alerts.
+			// doesn't trip warning-level alerts. Counts as a successful
+			// round-trip for /healthz purposes.
+			d.markSync(time.Now())
 			d.Logger.Info("download: object not in S3 yet", "key", d.Key)
 			return
 		}
@@ -159,6 +188,7 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 		newEtag = getEtag
 	}
 	d.lastEtag = newEtag
+	d.markSync(time.Now())
 	d.Logger.Info("download ok", "key", d.Key, "bytes", len(buf), "etag", newEtag, "path", d.Path)
 	return nil
 }

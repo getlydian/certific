@@ -268,3 +268,62 @@ func TestLoadConfigErrorIsNotNil(t *testing.T) {
 		t.Fatal("expected non-nil error")
 	}
 }
+
+func TestLoadConfigHealthAddrAndGrace(t *testing.T) {
+	// HealthAddr is opt-in; default is empty (disabled). When set, the
+	// upload-mode grace window defaults to 24h and download-mode
+	// ignores grace entirely in favour of 2×interval.
+	cfg, err := LoadConfig(baseUploadArgs(), nil, io.Discard)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.HealthAddr != "" {
+		t.Errorf("default HealthAddr = %q, want empty", cfg.HealthAddr)
+	}
+	if cfg.HealthGrace != DefaultHealthGrace {
+		t.Errorf("default upload HealthGrace = %s, want %s", cfg.HealthGrace, DefaultHealthGrace)
+	}
+
+	cfg, err = LoadConfig(append(baseUploadArgs(), "--health-addr", ":8080", "--health-grace", "10m"), nil, io.Discard)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.HealthAddr != ":8080" {
+		t.Errorf("HealthAddr = %q", cfg.HealthAddr)
+	}
+	if cfg.HealthGrace != 10*time.Minute {
+		t.Errorf("HealthGrace = %s, want 10m", cfg.HealthGrace)
+	}
+}
+
+func TestLoadConfigHealthGraceRejectedOnDownload(t *testing.T) {
+	// Symmetric to the --interval-on-upload rule: --health-grace is
+	// upload-only, so passing it on download must fail loudly. Download
+	// freshness derives from 2×interval automatically.
+	args := append(baseDownloadArgs(), "--health-grace", "5m")
+	_, err := LoadConfig(args, nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "--health-grace") {
+		t.Fatalf("err = %v, want --health-grace rejected on download", err)
+	}
+}
+
+func TestLoadConfigHealthGraceEnvIgnoredOnDownload(t *testing.T) {
+	// Mirror of TestLoadConfigIntervalEnvIgnoredOnUpload: a shared env
+	// shouldn't fail-fast just because the operator set
+	// CERTIFIC_HEALTH_GRACE in both sidecars' shared environment.
+	cfg, err := LoadConfig(baseDownloadArgs(), []string{"CERTIFIC_HEALTH_GRACE=5m"}, io.Discard)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.HealthGrace != 0 {
+		t.Errorf("HealthGrace = %s, want 0 in download mode regardless of env", cfg.HealthGrace)
+	}
+}
+
+func TestLoadConfigBadHealthGraceSyntax(t *testing.T) {
+	args := append(baseUploadArgs(), "--health-grace", "nope")
+	_, err := LoadConfig(args, nil, io.Discard)
+	if err == nil {
+		t.Fatal("expected parse error for bad --health-grace")
+	}
+}
