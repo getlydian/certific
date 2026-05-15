@@ -58,6 +58,13 @@ type BackoffConfig struct {
 
 const (
 	defaultDebounce = 500 * time.Millisecond
+	// shutdownFlushTimeout bounds the flush-on-cancel upload. The watch
+	// loop drains a pending debounced change after ctx is cancelled, but
+	// uploadWithRetry on its own would back off forever on a flaky S3 and
+	// hang container shutdown. Capping the flush keeps SIGTERM → exit
+	// within a predictable window; if the upload doesn't land in time the
+	// caller will retry on next boot.
+	shutdownFlushTimeout = 5 * time.Second
 )
 
 var defaultBackoff = BackoffConfig{
@@ -131,8 +138,12 @@ func (u *Uploader) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			// Flush pending change before returning so a Traefik write that
 			// landed inside the debounce window isn't dropped on shutdown.
+			// Bound the flush so a wedged S3 can't stall container exit;
+			// the next boot will re-read the file and re-upload.
 			if debounceCh != nil {
-				u.uploadWithRetry(context.Background(), backoff)
+				flushCtx, flushCancel := context.WithTimeout(context.Background(), shutdownFlushTimeout)
+				u.uploadWithRetry(flushCtx, backoff)
+				flushCancel()
 			}
 			return nil
 		case ev, ok := <-watcher.Events:

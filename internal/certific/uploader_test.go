@@ -378,6 +378,155 @@ func TestUploaderHandlesAtomicRename(t *testing.T) {
 	waitForObject(t, store, "acme.json", payload, 2*time.Second)
 }
 
+func TestUploaderCancellationReturns(t *testing.T) {
+	// SIGTERM must stop Run promptly. With no pending change, cancellation
+	// should return immediately; the container should not wait on a
+	// debounce timer or a phantom upload.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "acme.json")
+	if err := os.WriteFile(path, []byte("seed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := newFakeStore()
+	u := &Uploader{
+		Store:    store,
+		Path:     path,
+		Key:      "acme.json",
+		Debounce: shortDebounce,
+		Backoff:  fastBackoff,
+	}
+	cancel, done := startUploader(t, u)
+
+	// Let bootstrap + initial-upload settle so we're parked on the select.
+	waitForObject(t, store, "acme.json", []byte("seed"), 2*time.Second)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancel")
+	}
+}
+
+func TestUploaderFlushesPendingOnCancel(t *testing.T) {
+	// A Traefik write that lands inside the debounce window must not be
+	// dropped on shutdown — otherwise SIGTERM during cert issuance loses
+	// the new cert until the issuer next reschedules. Cancel mid-debounce
+	// and assert the bytes still reach S3.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "acme.json")
+
+	store := newFakeStore()
+	u := &Uploader{
+		Store: store,
+		Path:  path,
+		Key:   "acme.json",
+		// Long debounce so the cancel definitely lands before the timer
+		// fires — otherwise we'd be testing the steady-state path.
+		Debounce: 5 * time.Second,
+		Backoff:  fastBackoff,
+	}
+	cancel, done := startUploader(t, u)
+
+	// Wait for bootstrap + initial-upload of nothing (file doesn't exist)
+	// to settle. Bootstrap is synchronous, so a brief sleep is enough.
+	time.Sleep(50 * time.Millisecond)
+	store.resetCounts()
+
+	payload := []byte(`{"flushed":"on-cancel"}`)
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Give fsnotify a tick to deliver the event and the loop to arm the
+	// debounce timer; cancel before the timer fires.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancel")
+	}
+
+	// The flush path runs to completion before Run returns, so by the
+	// time done closes the Put must already have landed.
+	store.mu.Lock()
+	obj, ok := store.objects["acme.json"]
+	body := append([]byte(nil), obj.body...)
+	puts := store.putCalls
+	store.mu.Unlock()
+	if !ok || !bytes.Equal(body, payload) {
+		t.Fatalf("flushed object = %q (present=%v), want %q", body, ok, payload)
+	}
+	if puts != 1 {
+		t.Errorf("expected exactly 1 Put during flush, got %d", puts)
+	}
+}
+
+func TestUploaderShutdownFlushBoundedOnFlakyS3(t *testing.T) {
+	// If S3 is wedged during shutdown, the flush must not hang forever
+	// retrying. shutdownFlushTimeout caps it; Run returns soon after,
+	// container exits, next boot re-reads and re-uploads.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "acme.json")
+
+	// An ObjectStore whose Put always fails forces the retry loop in
+	// uploadWithRetry; the flush context's timeout is what eventually
+	// breaks it.
+	wedged := &alwaysFailPutStore{inner: newFakeStore(), err: errors.New("s3 wedged")}
+
+	u := &Uploader{
+		Store:    wedged,
+		Path:     path,
+		Key:      "acme.json",
+		Debounce: 5 * time.Second, // ensure debounce is still armed at cancel
+		Backoff:  fastBackoff,
+	}
+	cancel, done := startUploader(t, u)
+
+	time.Sleep(50 * time.Millisecond)
+
+	payload := []byte(`{"never":"lands"}`)
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+
+	// shutdownFlushTimeout is 5s in production; tests don't override it,
+	// so allow a generous bound and accept that this single test costs
+	// ~5s of wall time. The point being tested is "bounded," not "fast."
+	select {
+	case <-done:
+	case <-time.After(shutdownFlushTimeout + 2*time.Second):
+		t.Fatalf("Run did not return within %s of cancel — flush is unbounded", shutdownFlushTimeout+2*time.Second)
+	}
+}
+
+// alwaysFailPutStore wraps a fakeStore and fails every Put. Used to verify
+// that shutdown flush is bounded; a normal flakyStore eventually succeeds
+// which wouldn't exercise the timeout path.
+type alwaysFailPutStore struct {
+	inner *fakeStore
+	err   error
+}
+
+func (a *alwaysFailPutStore) Get(ctx context.Context, key string) (io.ReadCloser, string, error) {
+	return a.inner.Get(ctx, key)
+}
+func (a *alwaysFailPutStore) Head(ctx context.Context, key string) (string, time.Time, error) {
+	return a.inner.Head(ctx, key)
+}
+func (a *alwaysFailPutStore) Put(_ context.Context, _ string, body io.Reader, _ int64) error {
+	_, _ = io.Copy(io.Discard, body)
+	return a.err
+}
+
+var _ ObjectStore = (*alwaysFailPutStore)(nil)
+
 // errStore is a degenerate ObjectStore that only knows how to fail Get.
 // Used to test bootstrap's non-404 error propagation without dragging in
 // a full mocked SDK.
