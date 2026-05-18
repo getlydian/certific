@@ -148,21 +148,22 @@ func waitForRendered(t *testing.T, outDir, slug string, want []byte, deadline ti
 	t.Fatalf("timed out waiting for %s to equal %d bytes", path, len(want))
 }
 
-// waitNoCurrent polls until <outDir>/current does NOT exist, with a
-// short ceiling. Used after a 404-on-first-cycle to confirm nothing
-// was rendered.
-func waitNoCurrent(t *testing.T, outDir string, deadline time.Duration) {
+// waitForEmptySnapshot polls until <outDir>/current resolves to a
+// directory whose tls.yml lists no certificates. Used after a
+// 404-on-first-cycle to confirm we still produced a directory Traefik
+// can start against — even though no certs have been issued yet.
+func waitForEmptySnapshot(t *testing.T, outDir string, deadline time.Duration) {
 	t.Helper()
-	path := filepath.Join(outDir, "current")
+	tlsPath := filepath.Join(outDir, "current", "tls.yml")
 	end := time.Now().Add(deadline)
 	for time.Now().Before(end) {
-		_, err := os.Lstat(path)
-		if errors.Is(err, os.ErrNotExist) {
+		body, err := os.ReadFile(tlsPath)
+		if err == nil && bytes.Contains(body, []byte("certificates: []")) {
 			return
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("expected %s to not exist", path)
+	t.Fatalf("timed out waiting for empty snapshot at %s", tlsPath)
 }
 
 func TestDownloaderFirstCycleRendersCerts(t *testing.T) {
@@ -302,7 +303,9 @@ func TestDownloaderFetchesOnEtagChange(t *testing.T) {
 
 func TestDownloaderTolerates404OnFirstCycle(t *testing.T) {
 	// First-ever deploy: bucket is empty. Downloader must not crash and
-	// must not create an OutDir/current symlink out of nothing.
+	// must still produce <OutDir>/current — pointing at an empty
+	// snapshot — so Traefik can start its file provider against a real
+	// directory instead of looping unhealthy.
 	outDir := t.TempDir()
 
 	store := newFakeStore()
@@ -319,7 +322,7 @@ func TestDownloaderTolerates404OnFirstCycle(t *testing.T) {
 	defer func() { cancel(); <-done }()
 
 	clock.waitForWaiter(t)
-	waitNoCurrent(t, outDir, 100*time.Millisecond)
+	waitForEmptySnapshot(t, outDir, 2*time.Second)
 
 	// Now the writer uploads. Tick the clock and expect the rendered
 	// cert to appear — confirms the 404-tolerant path doesn't poison

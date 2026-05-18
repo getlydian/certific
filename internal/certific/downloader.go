@@ -35,9 +35,11 @@ const DefaultKeepVersions = 2
 //     render PEMs to <OutDir>/versions/<id>/, swap the
 //     <OutDir>/current symlink. Same-directory rename of the symlink
 //     is atomic, so Traefik never sees a half-applied update.
-//  3. ErrNotFound on Head is tolerated — it's the first-deploy case
-//     (writer hasn't uploaded yet). Other errors retry with
-//     exponential backoff + jitter.
+//  3. ErrNotFound on Head/Get is tolerated — it's the first-deploy case
+//     (writer hasn't uploaded yet). We render an empty snapshot so
+//     <OutDir>/current still exists; Traefik's file provider needs a
+//     directory to start against. Other errors retry with exponential
+//     backoff + jitter.
 //
 // "Head before Get" matters because acme.json grows with every issued
 // cert; in steady state we Get nothing and pay one ~200-byte Head per
@@ -152,16 +154,6 @@ func (d *Downloader) cycle(ctx context.Context, backoff BackoffConfig) {
 			d.Logger.Debug("download: etag unchanged, skipping", "key", d.Key, "etag", d.lastEtag)
 			return
 		}
-		if errors.Is(err, ErrNotFound) {
-			// First-deploy: writer hasn't uploaded yet. Not an error
-			// state in the operational sense; we'll check again next
-			// cycle. Log at info so it's visible during bring-up but
-			// doesn't trip warning-level alerts. Counts as a successful
-			// round-trip for /healthz purposes.
-			d.markSync(time.Now())
-			d.Logger.Info("download: object not in S3 yet", "key", d.Key)
-			return
-		}
 		d.Logger.Warn("download cycle failed, will retry", "attempt", attempt, "delay", delay, "err", err)
 		if !sleepCtx(ctx, jitter(delay, backoff.JitterFrac)) {
 			return
@@ -178,6 +170,15 @@ var errSkipped = errors.New("etag unchanged")
 func (d *Downloader) tryCycle(ctx context.Context) error {
 	etag, _, err := d.Store.Head(ctx, d.Key)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			// First-deploy: writer hasn't uploaded acme.json yet. Render
+			// an empty snapshot so <OutDir>/current exists and Traefik's
+			// file provider can start with an empty tls.certificates
+			// list. Without this, a gateway pointed at a not-yet-extant
+			// directory hangs on startup (or, with a directory-existence
+			// healthcheck, loops unhealthy forever).
+			return d.renderEmpty()
+		}
 		return fmt.Errorf("head: %w", err)
 	}
 	if etag != "" && etag == d.lastEtag {
@@ -186,6 +187,11 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 
 	body, getEtag, err := d.Store.Get(ctx, d.Key)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			// Head→Get race: object disappeared between calls. Same
+			// reasoning as the Head-404 branch.
+			return d.renderEmpty()
+		}
 		return fmt.Errorf("get: %w", err)
 	}
 	defer func() { _ = body.Close() }()
@@ -228,6 +234,36 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 		"version", versionDir,
 		"certs", len(certs),
 		"pruned", len(pruned),
+	)
+	return nil
+}
+
+// renderEmpty writes a versioned snapshot with no certs and points
+// `current` at it. Used when acme.json is missing or contains no usable
+// certs: Traefik still needs <OutDir>/current to exist so the file
+// provider can load (an empty tls.certificates list is valid).
+//
+// lastEtag stays empty so the very next cycle re-Heads and re-Gets once
+// the writer uploads — the Render call is content-addressed, so calling
+// it repeatedly with the same empty input is a cheap no-op after the
+// first one.
+func (d *Downloader) renderEmpty() error {
+	keep := d.Keep
+	if keep == 0 {
+		keep = DefaultKeepVersions
+	}
+	versionDir, _, err := Render(d.OutDir, nil, keep)
+	if err != nil {
+		return fmt.Errorf("render empty snapshot to %s: %w", d.OutDir, err)
+	}
+	d.markSync(time.Now())
+	// Debug-level: this fires every cycle while acme.json is missing or
+	// empty, and the first-deploy state can persist indefinitely. Render
+	// itself is a content-addressed no-op after the first call, so the
+	// log line is the only per-cycle cost worth suppressing.
+	d.Logger.Debug("download: no certs yet, re-rendered empty snapshot (idempotent)",
+		"key", d.Key,
+		"version", versionDir,
 	)
 	return nil
 }
