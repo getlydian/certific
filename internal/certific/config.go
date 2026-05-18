@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -42,9 +43,22 @@ const DefaultHealthGrace = 24 * time.Hour
 // Config is the resolved configuration for a single run. Fields are
 // populated by LoadConfig from flags, environment variables, and
 // defaults, in that precedence.
+//
+// Path and OutDir are mode-specific:
+//   - Upload watches Path (the issuer's acme.json) and ignores OutDir.
+//   - Download writes rendered cert PEMs and tls.yml under OutDir
+//     (a directory containing `current/` symlink and `versions/`)
+//     and ignores Path.
+//
+// They're kept as separate fields rather than reusing Path so error
+// messages can name the right flag and so a mistaken Path on a
+// download container is rejected loudly instead of silently treated as
+// an output directory.
 type Config struct {
 	Mode        Mode
-	Path        string
+	Path        string // upload mode: input acme.json file
+	OutDir      string // download mode: output dir for rendered cert PEMs + tls.yml
+	Keep        int    // download mode: snapshots to retain (0 → DefaultKeepVersions)
 	Bucket      string
 	Key         string
 	Region      string
@@ -67,11 +81,17 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 	cfg := Config{
 		Mode:       Mode(envOr(env, "CERTIFIC_MODE", "")),
 		Path:       envOr(env, "CERTIFIC_PATH", ""),
+		OutDir:     envOr(env, "CERTIFIC_OUT_DIR", ""),
 		Bucket:     envOr(env, "CERTIFIC_BUCKET", ""),
 		Key:        envOr(env, "CERTIFIC_KEY", "acme.json"),
 		Region:     envOr(env, "CERTIFIC_REGION", ""),
 		Endpoint:   envOr(env, "CERTIFIC_ENDPOINT", ""),
 		HealthAddr: envOr(env, "CERTIFIC_HEALTH_ADDR", ""),
+	}
+	if k, err := envInt(env, "CERTIFIC_KEEP", 0); err != nil {
+		return Config{}, err
+	} else {
+		cfg.Keep = k
 	}
 
 	var err error
@@ -90,7 +110,9 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 	modeStr := string(cfg.Mode)
 	logStr := cfg.LogLevel.String()
 	fs.StringVar(&modeStr, "mode", modeStr, "run mode: upload|download (CERTIFIC_MODE)")
-	fs.StringVar(&cfg.Path, "path", cfg.Path, "local acme.json path (CERTIFIC_PATH)")
+	fs.StringVar(&cfg.Path, "path", cfg.Path, "upload mode: local acme.json path (CERTIFIC_PATH)")
+	fs.StringVar(&cfg.OutDir, "out-dir", cfg.OutDir, "download mode: output dir for rendered cert PEMs + tls.yml; gateway Traefik points its file provider at <out-dir>/current (CERTIFIC_OUT_DIR)")
+	keepFlag := fs.String("keep", "", "download mode: number of past rendered snapshots to retain (CERTIFIC_KEEP, default 2)")
 	fs.StringVar(&cfg.Bucket, "bucket", cfg.Bucket, "S3 bucket name (CERTIFIC_BUCKET)")
 	fs.StringVar(&cfg.Key, "key", cfg.Key, "S3 object key (CERTIFIC_KEY)")
 	fs.StringVar(&cfg.Region, "region", cfg.Region, "S3 region (CERTIFIC_REGION)")
@@ -117,6 +139,15 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 		cfg.Interval = d
 	}
 
+	keepFromFlag := *keepFlag != ""
+	if keepFromFlag {
+		n, err := strconv.Atoi(*keepFlag)
+		if err != nil {
+			return Config{}, fmt.Errorf("--keep: %w", err)
+		}
+		cfg.Keep = n
+	}
+
 	healthGraceFromFlag := *healthGraceFlag != ""
 	if healthGraceFromFlag {
 		d, err := time.ParseDuration(*healthGraceFlag)
@@ -130,18 +161,19 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 		return Config{}, err
 	}
 
-	if err := cfg.validate(intervalFromFlag, healthGraceFromFlag); err != nil {
+	if err := cfg.validate(intervalFromFlag, healthGraceFromFlag, keepFromFlag); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
 // validate enforces the mode-specific required-field rules and the
-// "don't set download-only flags on upload" rule. intervalFromFlag and
-// healthGraceFromFlag report whether each flag was provided on the
-// command line, since env vs. flag have different rejection semantics
-// (env is ignored for non-applicable modes; flags are rejected).
-func (c *Config) validate(intervalFromFlag, healthGraceFromFlag bool) error {
+// "don't set the other mode's flags" rule. The *FromFlag booleans
+// report whether each conditional flag was provided on the command
+// line, since env vs. flag have different rejection semantics (env is
+// ignored for non-applicable modes; flags are rejected loudly to make
+// misconfigurations obvious).
+func (c *Config) validate(intervalFromFlag, healthGraceFromFlag, keepFromFlag bool) error {
 	switch c.Mode {
 	case "":
 		return fmt.Errorf("--mode is required (upload|download)")
@@ -150,9 +182,27 @@ func (c *Config) validate(intervalFromFlag, healthGraceFromFlag bool) error {
 		return fmt.Errorf("unknown mode %q (want upload|download)", c.Mode)
 	}
 
+	// Path is upload-only, OutDir is download-only. Each mode requires
+	// exactly one of them. Reject the other mode's flag loudly so an
+	// operator who mistakenly mounts a download container with a --path
+	// flag (or vice versa) sees the error at boot instead of silently
+	// getting wrong behavior.
 	var missing []string
-	if c.Path == "" {
-		missing = append(missing, "--path")
+	switch c.Mode {
+	case ModeUpload:
+		if c.Path == "" {
+			missing = append(missing, "--path")
+		}
+		if c.OutDir != "" {
+			return fmt.Errorf("--out-dir is only valid in download mode")
+		}
+	case ModeDownload:
+		if c.OutDir == "" {
+			missing = append(missing, "--out-dir")
+		}
+		if c.Path != "" {
+			return fmt.Errorf("--path is only valid in upload mode")
+		}
 	}
 	if c.Bucket == "" {
 		missing = append(missing, "--bucket")
@@ -167,6 +217,9 @@ func (c *Config) validate(intervalFromFlag, healthGraceFromFlag bool) error {
 	if c.Mode == ModeUpload && intervalFromFlag {
 		return fmt.Errorf("--interval is only valid in download mode")
 	}
+	if c.Mode == ModeUpload && keepFromFlag {
+		return fmt.Errorf("--keep is only valid in download mode")
+	}
 
 	if c.Mode == ModeDownload {
 		if c.Interval < MinInterval || c.Interval > MaxInterval {
@@ -180,9 +233,11 @@ func (c *Config) validate(intervalFromFlag, healthGraceFromFlag bool) error {
 		}
 		c.HealthGrace = 0
 	} else {
-		// Upload mode doesn't use Interval; zero it so accidental reads
-		// downstream produce an obvious "0s" rather than a stale default.
+		// Upload mode doesn't use Interval/Keep; zero them so accidental
+		// reads downstream produce an obvious zero value rather than a
+		// stale default.
 		c.Interval = 0
+		c.Keep = 0
 		if c.HealthGrace <= 0 {
 			return fmt.Errorf("--health-grace must be > 0, got %s", c.HealthGrace)
 		}
@@ -208,6 +263,18 @@ func envOr(env map[string]string, key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envInt(env map[string]string, key string, def int) (int, error) {
+	v, ok := env[key]
+	if !ok || v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	return n, nil
 }
 
 func envDuration(env map[string]string, key string, def time.Duration) (time.Duration, error) {

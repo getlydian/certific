@@ -22,27 +22,35 @@ gateway terminate TLS locally.
 
 ## Approach
 
-Run one writer, treat S3 as the bus, keep every gateway as a reader.
+Run one writer, treat S3 as the bus, keep every gateway as a reader —
+but only ship cert material to the gateways, not the issuer's whole
+ACME state.
 
 - One issuer-side Traefik holds the DNS provider credentials and is the
-  only process that can ever start an ACME flow.
+  only process that can ever start an ACME flow. Its `acme.json` lives
+  on a single node-local volume alongside `certific upload`.
 - The same Traefik labels that already drive routing on the gateways drive
   issuance on the issuer, so adding a routed service doesn't require a
   parallel cert config.
-- `acme.json` moves between issuer and gateways over S3: the issuer
-  uploads on every change; gateways poll on a fixed interval and atomically
-  replace their local copy.
-- The gateways physically cannot start an ACME flow. A cache miss on a
+- `certific upload` pushes the issuer's `acme.json` to S3 on every change.
+- `certific download` on each gateway pulls `acme.json` from S3, parses
+  it, and renders one `.crt` + `.key` per certificate plus a `tls.yml`
+  index into a versioned snapshot under `<out-dir>/versions/<id>/`.
+  After each successful render it atomically swaps `<out-dir>/current`
+  (a symlink) to point at the new snapshot.
+- Gateway Traefik runs with `--providers.file.directory=<out-dir>/current`
+  and **no `certificatesResolvers` block at all**. It physically cannot
+  start an ACME flow even if the directory is empty — a cache miss on a
   brand-new domain fails the TLS handshake on that one gateway until the
-  next sync — bounded, visible, and self-healing — rather than producing
-  a silent race.
+  next sync, which is bounded, visible, and self-healing rather than a
+  silent race.
 
 `certific` is the sidecar that does the shuttling. One image, one binary,
 two modes:
 
 ```
 certific upload   --path /etc/acme/acme.json --bucket … --key acme.json
-certific download --path /etc/acme/acme.json --bucket … --key acme.json --interval 60s
+certific download --out-dir /etc/certs       --bucket … --key acme.json --interval 60s
 ```
 
 In `upload` mode it watches the local `acme.json` with `fsnotify`,
@@ -51,9 +59,14 @@ sha256). On boot it first tries to seed the local file from S3 so the
 issuer Traefik starts with a warm cache.
 
 In `download` mode it polls S3 on `--interval`, `HEAD`s first so an
-unchanged object never re-downloads, writes to a tempfile in the same
-directory as `--path`, then `os.Rename`s for an atomic swap. The new file
-is `chmod 0600` because `acme.json` contains private keys.
+unchanged object never re-downloads, parses the fetched bytes into
+per-domain PEM cert/key pairs, writes them to a new
+`<out-dir>/versions/<id>/` snapshot alongside a `tls.yml` Traefik
+dynamic config that lists them, then renames a sibling `current.new`
+symlink onto `current`. Same-directory symlink rename is atomic on
+POSIX filesystems, so the gateway Traefik never sees a half-applied
+update. All output files are `chmod 0600` because they contain private
+keys; older snapshots are pruned to `--keep` (default 2).
 
 Both modes back off with jitter on transient S3 errors and keep running.
 Downstream Traefiks keep serving the last good cert until S3 recovers.
@@ -105,20 +118,22 @@ docker service create \
   --constraint 'node.labels.role==gateway' \
   --publish published=443,target=443 \
   --publish published=80,target=80 \
-  --mount type=volume,source=acme-gateway,target=/etc/acme \
-  traefik:v3.6
+  --mount type=volume,source=gateway-certs,target=/etc/certs \
+  traefik:v3.6 \
+  --providers.file.directory=/etc/certs/current \
+  --providers.file.watch=true
 
 docker service create \
   --name certific-download \
   --mode global \
   --constraint 'node.labels.role==gateway' \
-  --mount type=volume,source=acme-gateway,target=/etc/acme \
+  --mount type=volume,source=gateway-certs,target=/etc/certs \
   --env AWS_ACCESS_KEY_ID=… \
   --env AWS_SECRET_ACCESS_KEY=… \
   --env CERTIFIC_REGION=us-east-1 \
   ghcr.io/<owner>/certific:latest \
   --mode download \
-  --path /etc/acme/acme.json \
+  --out-dir /etc/certs \
   --bucket example-acme \
   --key acme.json \
   --interval 60s
@@ -126,8 +141,10 @@ docker service create \
 
 The issuer-side `traefik` and `certific upload` share the `acme-issuer`
 volume on the same node. The gateway-side `traefik` and `certific
-download` share the per-node `acme-gateway` volume (one volume per
-gateway node — they don't share state between gateways).
+download` share the per-node `gateway-certs` volume (one volume per
+gateway node — they don't share state between gateways). Traefik's
+file provider follows the `current` symlink and reloads when its
+target changes.
 
 A worked compose example lives at
 [examples/swarm/compose.yml](examples/swarm/compose.yml) and covers the
@@ -144,7 +161,9 @@ upload and download sidecars.
 | Flag | Env | Modes | Default | Description |
 | ---- | --- | ----- | ------- | ----------- |
 | `--mode` | `CERTIFIC_MODE` | both | _required_ | `upload` or `download`. |
-| `--path` | `CERTIFIC_PATH` | both | _required_ | Local path to `acme.json`. |
+| `--path` | `CERTIFIC_PATH` | upload | _required_ | Local path to the issuer's `acme.json`. Rejected on download. |
+| `--out-dir` | `CERTIFIC_OUT_DIR` | download | _required_ | Output directory; rendered snapshots land at `<out-dir>/versions/<id>/` and the active one is symlinked from `<out-dir>/current`. Point Traefik's file provider at `<out-dir>/current`. Rejected on upload. |
+| `--keep` | `CERTIFIC_KEEP` | download | `2` | Number of past snapshots to retain after each render. |
 | `--bucket` | `CERTIFIC_BUCKET` | both | _required_ | S3 bucket name. |
 | `--key` | `CERTIFIC_KEY` | both | `acme.json` | S3 object key. |
 | `--region` | `CERTIFIC_REGION` | both | _SDK default_ | S3 region. |
@@ -229,7 +248,14 @@ all.
   `PutObject`. Enabling S3 versioning on the bucket adds a cheap rollback
   path if a bad upload ever does land.
 - **Corrupted local file on a gateway.** The next download cycle
-  overwrites it via the same atomic-rename path used for every sync.
+  re-parses `acme.json`, renders a fresh snapshot dir, and swaps the
+  `current` symlink — both unaffected by the contents of the previous
+  snapshot. Deleting `<out-dir>/current` manually forces a re-render on
+  the next interval.
+- **`acme.json` parse error mid-flight.** The downloader logs the parse
+  error and does not update `lastEtag`, so the next interval re-fetches
+  and re-parses. The previous `current` snapshot keeps serving in the
+  meantime; gateways never serve from a half-parsed file.
 
 ## Limitations
 

@@ -3,7 +3,9 @@ package certific
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -86,10 +88,55 @@ func startDownloader(t *testing.T, d *Downloader) (cancel context.CancelFunc, do
 	return cancel, done
 }
 
-// waitForFile polls until path contains want or the deadline expires.
-// Same shape as waitForObject on the uploader side.
-func waitForFile(t *testing.T, path string, want []byte, deadline time.Duration) {
+// fakeCert represents one cert+key pair used to build a synthetic
+// acme.json payload. ParseAcme only base64-decodes the bytes — it does
+// not verify PEM structure — so test fixtures don't need to be real
+// X.509. Any deterministic byte string is fine and keeps the tests
+// fast and dependency-free.
+type fakeCert struct {
+	main string
+	sans []string
+	cert []byte
+	key  []byte
+}
+
+// buildAcmeJSON renders a minimal Traefik-shaped acme.json carrying the
+// given certs under one resolver name. Used by tests that need real
+// downstream rendering, not just an opaque blob.
+func buildAcmeJSON(resolver string, certs ...fakeCert) []byte {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, `{%q:{"Account":{},"Certificates":[`, resolver)
+	for i, c := range certs {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"domain":{"main":%q`, c.main)
+		if len(c.sans) > 0 {
+			b.WriteString(`,"sans":[`)
+			for j, s := range c.sans {
+				if j > 0 {
+					b.WriteByte(',')
+				}
+				fmt.Fprintf(&b, "%q", s)
+			}
+			b.WriteByte(']')
+		}
+		fmt.Fprintf(&b, `},"certificate":%q,"key":%q}`,
+			base64.StdEncoding.EncodeToString(c.cert),
+			base64.StdEncoding.EncodeToString(c.key),
+		)
+	}
+	b.WriteString(`]}}`)
+	return b.Bytes()
+}
+
+// waitForRendered polls until <outDir>/current/<slug>.crt contains want,
+// or the deadline expires. The downloader rewrites the symlink atomically
+// at the end of each successful cycle, so any read through `current/`
+// either sees the previous snapshot or the new one — never a partial.
+func waitForRendered(t *testing.T, outDir, slug string, want []byte, deadline time.Duration) {
 	t.Helper()
+	path := filepath.Join(outDir, "current", slug+".crt")
 	end := time.Now().Add(deadline)
 	for time.Now().Before(end) {
 		got, err := os.ReadFile(path)
@@ -98,17 +145,38 @@ func waitForFile(t *testing.T, path string, want []byte, deadline time.Duration)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s to equal %q", path, want)
+	t.Fatalf("timed out waiting for %s to equal %d bytes", path, len(want))
 }
 
-func TestDownloaderFirstCycleFetches(t *testing.T) {
+// waitNoCurrent polls until <outDir>/current does NOT exist, with a
+// short ceiling. Used after a 404-on-first-cycle to confirm nothing
+// was rendered.
+func waitNoCurrent(t *testing.T, outDir string, deadline time.Duration) {
+	t.Helper()
+	path := filepath.Join(outDir, "current")
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		_, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("expected %s to not exist", path)
+}
+
+func TestDownloaderFirstCycleRendersCerts(t *testing.T) {
 	// Boot path: object is already in S3 (writer ran first). Downloader
-	// must fetch it on its first cycle without waiting for an interval.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "acme.json")
+	// must fetch and render to <OutDir>/current on its first cycle
+	// without waiting for an interval.
+	outDir := t.TempDir()
 
 	store := newFakeStore()
-	payload := []byte(`{"first":"download"}`)
+	payload := buildAcmeJSON("dns", fakeCert{
+		main: "example.com",
+		cert: []byte("---cert-bytes---"),
+		key:  []byte("---key-bytes---"),
+	})
 	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(payload), int64(len(payload))); err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +184,7 @@ func TestDownloaderFirstCycleFetches(t *testing.T) {
 	clock := newFakeClock()
 	d := &Downloader{
 		Store:    store,
-		Path:     path,
+		OutDir:   outDir,
 		Key:      "acme.json",
 		Interval: 60 * time.Second,
 		Backoff:  fastBackoff,
@@ -125,17 +193,31 @@ func TestDownloaderFirstCycleFetches(t *testing.T) {
 	cancel, done := startDownloader(t, d)
 	defer func() { cancel(); <-done }()
 
-	waitForFile(t, path, payload, 2*time.Second)
+	waitForRendered(t, outDir, "example.com", []byte("---cert-bytes---"), 2*time.Second)
+
+	// tls.yml should reference the rendered cert by relative filename so
+	// Traefik's file provider, pointed at <outDir>/current, can load it
+	// without any path translation.
+	tlsYml, err := os.ReadFile(filepath.Join(outDir, "current", "tls.yml"))
+	if err != nil {
+		t.Fatalf("read tls.yml: %v", err)
+	}
+	if !bytes.Contains(tlsYml, []byte("example.com.crt")) {
+		t.Errorf("tls.yml missing cert reference: %s", tlsYml)
+	}
 }
 
 func TestDownloaderSkipsUnchangedEtag(t *testing.T) {
 	// Steady-state: writer hasn't issued any new certs, etag is stable.
 	// Downloader must Head every interval but Get nothing.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "acme.json")
+	outDir := t.TempDir()
 
 	store := newFakeStore()
-	payload := []byte(`{"unchanged":"yes"}`)
+	payload := buildAcmeJSON("dns", fakeCert{
+		main: "example.com",
+		cert: []byte("cert"),
+		key:  []byte("key"),
+	})
 	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(payload), int64(len(payload))); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +227,7 @@ func TestDownloaderSkipsUnchangedEtag(t *testing.T) {
 
 	d := &Downloader{
 		Store:    counts,
-		Path:     path,
+		OutDir:   outDir,
 		Key:      "acme.json",
 		Interval: 60 * time.Second,
 		Backoff:  fastBackoff,
@@ -154,8 +236,8 @@ func TestDownloaderSkipsUnchangedEtag(t *testing.T) {
 	cancel, done := startDownloader(t, d)
 	defer func() { cancel(); <-done }()
 
-	// First cycle fires immediately on Run; wait for the file to land.
-	waitForFile(t, path, payload, 2*time.Second)
+	// First cycle fires immediately on Run; wait for the cert to land.
+	waitForRendered(t, outDir, "example.com", []byte("cert"), 2*time.Second)
 	firstGets := atomic.LoadInt32(&counts.getCalls)
 	if firstGets != 1 {
 		t.Fatalf("first cycle should Get once, got %d", firstGets)
@@ -169,8 +251,6 @@ func TestDownloaderSkipsUnchangedEtag(t *testing.T) {
 			t.Fatal("expected pending waiter")
 		}
 	}
-	// Wait for the third extra cycle to complete by waiting for the
-	// next After registration.
 	clock.waitForWaiter(t)
 
 	gets := atomic.LoadInt32(&counts.getCalls)
@@ -185,12 +265,11 @@ func TestDownloaderSkipsUnchangedEtag(t *testing.T) {
 
 func TestDownloaderFetchesOnEtagChange(t *testing.T) {
 	// Writer issues a new cert → acme.json changes → etag changes →
-	// downloader Gets the new bytes and atomically replaces the file.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "acme.json")
+	// downloader Gets, re-renders, and swaps `current` to the new dir.
+	outDir := t.TempDir()
 
 	store := newFakeStore()
-	v1 := []byte(`{"v":1}`)
+	v1 := buildAcmeJSON("dns", fakeCert{main: "example.com", cert: []byte("v1cert"), key: []byte("v1key")})
 	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(v1), int64(len(v1))); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +277,7 @@ func TestDownloaderFetchesOnEtagChange(t *testing.T) {
 	clock := newFakeClock()
 	d := &Downloader{
 		Store:    store,
-		Path:     path,
+		OutDir:   outDir,
 		Key:      "acme.json",
 		Interval: 60 * time.Second,
 		Backoff:  fastBackoff,
@@ -207,10 +286,10 @@ func TestDownloaderFetchesOnEtagChange(t *testing.T) {
 	cancel, done := startDownloader(t, d)
 	defer func() { cancel(); <-done }()
 
-	waitForFile(t, path, v1, 2*time.Second)
+	waitForRendered(t, outDir, "example.com", []byte("v1cert"), 2*time.Second)
 
 	// Mutate the S3 object: same key, new bytes → new etag.
-	v2 := []byte(`{"v":2}`)
+	v2 := buildAcmeJSON("dns", fakeCert{main: "example.com", cert: []byte("v2cert"), key: []byte("v2key")})
 	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(v2), int64(len(v2))); err != nil {
 		t.Fatal(err)
 	}
@@ -218,20 +297,19 @@ func TestDownloaderFetchesOnEtagChange(t *testing.T) {
 	clock.waitForWaiter(t)
 	clock.tick()
 
-	waitForFile(t, path, v2, 2*time.Second)
+	waitForRendered(t, outDir, "example.com", []byte("v2cert"), 2*time.Second)
 }
 
 func TestDownloaderTolerates404OnFirstCycle(t *testing.T) {
 	// First-ever deploy: bucket is empty. Downloader must not crash and
-	// must not create a local file out of nothing.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "acme.json")
+	// must not create an OutDir/current symlink out of nothing.
+	outDir := t.TempDir()
 
 	store := newFakeStore()
 	clock := newFakeClock()
 	d := &Downloader{
 		Store:    store,
-		Path:     path,
+		OutDir:   outDir,
 		Key:      "acme.json",
 		Interval: 60 * time.Second,
 		Backoff:  fastBackoff,
@@ -241,30 +319,27 @@ func TestDownloaderTolerates404OnFirstCycle(t *testing.T) {
 	defer func() { cancel(); <-done }()
 
 	clock.waitForWaiter(t)
+	waitNoCurrent(t, outDir, 100*time.Millisecond)
 
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("local file should not exist after empty-bucket cycle, stat err=%v", err)
-	}
-
-	// Now the writer uploads. Tick the clock and expect the file to
-	// appear — confirms the 404-tolerant path doesn't poison lastEtag.
-	payload := []byte(`{"finally":"there"}`)
+	// Now the writer uploads. Tick the clock and expect the rendered
+	// cert to appear — confirms the 404-tolerant path doesn't poison
+	// lastEtag.
+	payload := buildAcmeJSON("dns", fakeCert{main: "finally.example", cert: []byte("therecert"), key: []byte("therekey")})
 	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(payload), int64(len(payload))); err != nil {
 		t.Fatal(err)
 	}
 	clock.tick()
-	waitForFile(t, path, payload, 2*time.Second)
+	waitForRendered(t, outDir, "finally.example", []byte("therecert"), 2*time.Second)
 }
 
 func TestDownloaderRetriesOnTransientError(t *testing.T) {
 	// S3 hiccups during a cycle must not crash the downloader. cycle()
 	// retries within the same tick using backoff; we verify the file
 	// eventually lands after two transient Head failures.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "acme.json")
+	outDir := t.TempDir()
 
 	inner := newFakeStore()
-	payload := []byte(`{"retry":"works"}`)
+	payload := buildAcmeJSON("dns", fakeCert{main: "retry.example", cert: []byte("worksbytes"), key: []byte("keybytes")})
 	if err := inner.Put(context.Background(), "acme.json", bytes.NewReader(payload), int64(len(payload))); err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +353,7 @@ func TestDownloaderRetriesOnTransientError(t *testing.T) {
 	clock := newFakeClock()
 	d := &Downloader{
 		Store:    flaky,
-		Path:     path,
+		OutDir:   outDir,
 		Key:      "acme.json",
 		Interval: 60 * time.Second,
 		Backoff:  fastBackoff,
@@ -287,21 +362,20 @@ func TestDownloaderRetriesOnTransientError(t *testing.T) {
 	cancel, done := startDownloader(t, d)
 	defer func() { cancel(); <-done }()
 
-	waitForFile(t, path, payload, 2*time.Second)
+	waitForRendered(t, outDir, "retry.example", []byte("worksbytes"), 2*time.Second)
 	if got := atomic.LoadInt32(&flaky.failed); got != 2 {
 		t.Errorf("expected 2 failed Heads before success, got %d", got)
 	}
 }
 
 func TestDownloaderWritesMode0600(t *testing.T) {
-	// acme.json contains private keys. The atomic-replace path must end
-	// with mode 0600 even if the tempfile was created with the default
-	// umask-influenced mode.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "acme.json")
+	// Rendered .crt/.key files contain private keys. The renderer must
+	// end with mode 0600 on every output file, even if the umask would
+	// otherwise produce a wider mode.
+	outDir := t.TempDir()
 
 	store := newFakeStore()
-	payload := []byte(`{"secret":"keys"}`)
+	payload := buildAcmeJSON("dns", fakeCert{main: "secret.example", cert: []byte("cert"), key: []byte("private")})
 	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(payload), int64(len(payload))); err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +383,7 @@ func TestDownloaderWritesMode0600(t *testing.T) {
 	clock := newFakeClock()
 	d := &Downloader{
 		Store:    store,
-		Path:     path,
+		OutDir:   outDir,
 		Key:      "acme.json",
 		Interval: 60 * time.Second,
 		Backoff:  fastBackoff,
@@ -318,41 +392,38 @@ func TestDownloaderWritesMode0600(t *testing.T) {
 	cancel, done := startDownloader(t, d)
 	defer func() { cancel(); <-done }()
 
-	waitForFile(t, path, payload, 2*time.Second)
+	waitForRendered(t, outDir, "secret.example", []byte("cert"), 2*time.Second)
 
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("file mode = %o, want 0600", perm)
+	for _, name := range []string{"secret.example.crt", "secret.example.key", "tls.yml"} {
+		info, err := os.Stat(filepath.Join(outDir, "current", name))
+		if err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("%s mode = %o, want 0600", name, perm)
+		}
 	}
 }
 
-func TestDownloaderAtomicReplace(t *testing.T) {
-	// Verify the rename-after-tempfile pattern by pre-populating Path
-	// with old content; while the new bytes are in flight a concurrent
-	// reader must see either the old or the new file, never a partial
-	// one. Race-checking is hard; what we *can* verify is that the
-	// downloader never opens Path for writing directly (no truncation
-	// window), which we approximate by checking no .tmp-* leftovers
-	// remain in the directory after success.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "acme.json")
-	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+func TestDownloaderAtomicSwap(t *testing.T) {
+	// Verify the symlink-swap pattern by pre-populating OutDir with an
+	// older snapshot pointed-at by `current`. After a successful cycle,
+	// `current` must still resolve to a populated, internally-consistent
+	// directory (no half-written tls.yml). We approximate atomicity by
+	// checking that `current` is a symlink targeting a `versions/<id>/`
+	// dir, and that no `.tmp` staging dirs remain after success.
+	outDir := t.TempDir()
 
 	store := newFakeStore()
-	payload := []byte(`{"new":"contents"}`)
-	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(payload), int64(len(payload))); err != nil {
+	v1 := buildAcmeJSON("dns", fakeCert{main: "first.example", cert: []byte("a"), key: []byte("b")})
+	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(v1), int64(len(v1))); err != nil {
 		t.Fatal(err)
 	}
 
 	clock := newFakeClock()
 	d := &Downloader{
 		Store:    store,
-		Path:     path,
+		OutDir:   outDir,
 		Key:      "acme.json",
 		Interval: 60 * time.Second,
 		Backoff:  fastBackoff,
@@ -361,17 +432,27 @@ func TestDownloaderAtomicReplace(t *testing.T) {
 	cancel, done := startDownloader(t, d)
 	defer func() { cancel(); <-done }()
 
-	waitForFile(t, path, payload, 2*time.Second)
+	waitForRendered(t, outDir, "first.example", []byte("a"), 2*time.Second)
 
-	entries, err := os.ReadDir(dir)
+	// current must be a symlink, not a real directory — that's the
+	// whole atomicity contract.
+	info, err := os.Lstat(filepath.Join(outDir, "current"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("lstat current: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("current is not a symlink (mode=%v)", info.Mode())
+	}
+
+	// No leftover .tmp staging dirs after the cycle.
+	entries, err := os.ReadDir(filepath.Join(outDir, "versions"))
+	if err != nil {
+		t.Fatalf("read versions: %v", err)
 	}
 	for _, e := range entries {
-		if e.Name() == "acme.json" {
-			continue
+		if filepath.Ext(e.Name()) == ".tmp" {
+			t.Errorf("leftover staging dir: %s", e.Name())
 		}
-		t.Errorf("unexpected leftover file in dir: %s", e.Name())
 	}
 }
 
@@ -379,12 +460,12 @@ func TestDownloaderCancellationReturns(t *testing.T) {
 	// Context cancellation must stop Run promptly even while waiting on
 	// the After channel. Without this property, SIGTERM would hang for
 	// up to one interval (60s in production) before the container exits.
-	dir := t.TempDir()
+	outDir := t.TempDir()
 	store := newFakeStore()
 	clock := newFakeClock()
 	d := &Downloader{
 		Store:    store,
-		Path:     filepath.Join(dir, "acme.json"),
+		OutDir:   outDir,
 		Key:      "acme.json",
 		Interval: time.Hour, // long enough that real time.After would hang the test
 		Backoff:  fastBackoff,
@@ -408,13 +489,73 @@ func TestDownloaderRejectsZeroInterval(t *testing.T) {
 	// interval would busy-loop, so it's worth a sharp error.
 	d := &Downloader{
 		Store:    newFakeStore(),
-		Path:     "/tmp/never-used",
+		OutDir:   "/tmp/never-used",
 		Key:      "acme.json",
 		Interval: 0,
 	}
 	err := d.Run(context.Background())
 	if err == nil {
 		t.Fatal("expected error for zero interval, got nil")
+	}
+}
+
+func TestDownloaderPrunesOldSnapshots(t *testing.T) {
+	// After three distinct renders with Keep=1, `versions/` should
+	// contain at most two dirs: the active one and one prior. Sanity
+	// check on the prune wiring; full prune logic is exercised by
+	// render_test.go.
+	outDir := t.TempDir()
+	store := newFakeStore()
+	clock := newFakeClock()
+	d := &Downloader{
+		Store:    store,
+		OutDir:   outDir,
+		Key:      "acme.json",
+		Interval: 60 * time.Second,
+		Backoff:  fastBackoff,
+		After:    clock.After,
+		Keep:     1,
+	}
+	cancel, done := startDownloader(t, d)
+	defer func() { cancel(); <-done }()
+
+	for i, body := range [][]byte{
+		buildAcmeJSON("dns", fakeCert{main: "a.example", cert: []byte("a1"), key: []byte("k1")}),
+		buildAcmeJSON("dns", fakeCert{main: "a.example", cert: []byte("a2"), key: []byte("k2")}),
+		buildAcmeJSON("dns", fakeCert{main: "a.example", cert: []byte("a3"), key: []byte("k3")}),
+	} {
+		if err := store.Put(context.Background(), "acme.json", bytes.NewReader(body), int64(len(body))); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			// First cycle fires immediately on Run; no tick needed.
+		} else {
+			clock.waitForWaiter(t)
+			clock.tick()
+		}
+		// Each render embeds a wall-clock second in the version id, so
+		// without this pause two consecutive renders can land in the
+		// same id and short-circuit to "directory already exists" —
+		// which is correct behaviour but defeats the test.
+		time.Sleep(1100 * time.Millisecond)
+		// Wait for the cert from this iteration to be the active one.
+		wantCert := []byte(fmt.Sprintf("a%d", i+1))
+		waitForRendered(t, outDir, "a.example", wantCert, 2*time.Second)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(outDir, "versions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dirs int
+	for _, e := range entries {
+		if e.IsDir() && filepath.Ext(e.Name()) != ".tmp" {
+			dirs++
+		}
+	}
+	// active + Keep=1 prior = 2 expected.
+	if dirs > 2 {
+		t.Errorf("versions/ contains %d dirs, want ≤ 2 with Keep=1", dirs)
 	}
 }
 

@@ -124,9 +124,10 @@ func runDownload(ctx context.Context, cfg certific.Config, logger *slog.Logger) 
 	}
 	d := &certific.Downloader{
 		Store:    store,
-		Path:     cfg.Path,
+		OutDir:   cfg.OutDir,
 		Key:      cfg.Key,
 		Interval: cfg.Interval,
+		Keep:     cfg.Keep,
 		Logger:   logger,
 	}
 	// Downloader's freshness budget is 2×interval: one interval to

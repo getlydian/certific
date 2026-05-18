@@ -21,7 +21,7 @@ func baseUploadArgs() []string {
 func baseDownloadArgs() []string {
 	return []string{
 		"--mode", "download",
-		"--path", "/etc/acme/acme.json",
+		"--out-dir", "/etc/acme/out",
 		"--bucket", "b",
 		"--key", "acme.json",
 	}
@@ -62,7 +62,7 @@ func TestLoadConfigFlagBeatsEnv(t *testing.T) {
 	}
 	args := []string{
 		"--mode", "download",
-		"--path", "/etc/acme/acme.json",
+		"--out-dir", "/etc/acme/out",
 		"--bucket", "from-flag",
 		"--key", "acme.json",
 		"--interval", "45s",
@@ -84,7 +84,7 @@ func TestLoadConfigFlagBeatsEnv(t *testing.T) {
 func TestLoadConfigEnvBeatsDefault(t *testing.T) {
 	env := []string{
 		"CERTIFIC_MODE=download",
-		"CERTIFIC_PATH=/var/lib/acme.json",
+		"CERTIFIC_OUT_DIR=/var/lib/acme-out",
 		"CERTIFIC_BUCKET=b",
 		"CERTIFIC_KEY=acme.json",
 		"CERTIFIC_INTERVAL=2m",
@@ -99,8 +99,8 @@ func TestLoadConfigEnvBeatsDefault(t *testing.T) {
 	if cfg.Mode != ModeDownload {
 		t.Errorf("Mode = %q, want download", cfg.Mode)
 	}
-	if cfg.Path != "/var/lib/acme.json" {
-		t.Errorf("Path = %q", cfg.Path)
+	if cfg.OutDir != "/var/lib/acme-out" {
+		t.Errorf("OutDir = %q", cfg.OutDir)
 	}
 	if cfg.Interval != 2*time.Minute {
 		t.Errorf("Interval = %s, want 2m", cfg.Interval)
@@ -138,6 +138,64 @@ func TestLoadConfigMissingRequired(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--path") || !strings.Contains(err.Error(), "--bucket") {
 		t.Errorf("error %q should list missing required flags", err)
+	}
+}
+
+// TestLoadConfigDownloadMissingOutDir mirrors TestLoadConfigMissingRequired
+// for the download side: download needs --out-dir, not --path.
+func TestLoadConfigDownloadMissingOutDir(t *testing.T) {
+	_, err := LoadConfig([]string{"--mode", "download", "--bucket", "b"}, nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "--out-dir") {
+		t.Fatalf("err = %v, want missing --out-dir error", err)
+	}
+}
+
+// TestLoadConfigPathRejectedOnDownload: --path is upload-only. Passing
+// it on download mode is a misconfiguration we want to surface loudly,
+// not silently treat as an output directory.
+func TestLoadConfigPathRejectedOnDownload(t *testing.T) {
+	args := []string{
+		"--mode", "download",
+		"--path", "/etc/acme/acme.json",
+		"--out-dir", "/etc/acme/out",
+		"--bucket", "b",
+		"--key", "acme.json",
+	}
+	_, err := LoadConfig(args, nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "--path") {
+		t.Fatalf("err = %v, want --path rejected on download", err)
+	}
+}
+
+// TestLoadConfigOutDirRejectedOnUpload: symmetric to the above —
+// --out-dir is download-only.
+func TestLoadConfigOutDirRejectedOnUpload(t *testing.T) {
+	args := append(baseUploadArgs(), "--out-dir", "/etc/acme/out")
+	_, err := LoadConfig(args, nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "--out-dir") {
+		t.Fatalf("err = %v, want --out-dir rejected on upload", err)
+	}
+}
+
+// TestLoadConfigKeepFlag pins the parse path for --keep, the
+// snapshot-retention knob used by download mode's prune step.
+func TestLoadConfigKeepFlag(t *testing.T) {
+	args := append(baseDownloadArgs(), "--keep", "5")
+	cfg, err := LoadConfig(args, nil, io.Discard)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Keep != 5 {
+		t.Errorf("Keep = %d, want 5", cfg.Keep)
+	}
+}
+
+// TestLoadConfigKeepRejectedOnUpload: --keep is download-only.
+func TestLoadConfigKeepRejectedOnUpload(t *testing.T) {
+	args := append(baseUploadArgs(), "--keep", "5")
+	_, err := LoadConfig(args, nil, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "--keep") {
+		t.Fatalf("err = %v, want --keep rejected on upload", err)
 	}
 }
 

@@ -10,19 +10,31 @@ import (
 	"time"
 )
 
-// Downloader polls S3 for changes to a single object and atomically
-// replaces a local file when the remote etag changes. One instance per
-// gateway: the design assumes many readers per writer, and each gateway
-// runs its own copy alongside its Traefik replica.
+// DefaultKeepVersions is the number of past rendered snapshots retained
+// under <OutDir>/versions/ after a successful swap. One is enough to roll
+// back manually if a bad acme.json reaches gateways; more is wasted disk.
+const DefaultKeepVersions = 2
+
+// Downloader polls S3 for changes to acme.json and, when the remote
+// etag changes, fetches it, parses it into per-domain cert/key PEMs,
+// and atomically swaps a `current` symlink under OutDir to point at the
+// new versioned snapshot. Traefik's file provider, pointed at
+// <OutDir>/current, sees a consistent directory at all times.
+//
+// The gateway-side Traefik has NO certificatesResolvers configured — it
+// can't even attempt ACME. It only loads the cert files the file
+// provider points it at. That's the whole point of this design: the
+// raw acme.json never reaches gateways, only the cert material it
+// happens to contain.
 //
 // Lifecycle:
 //  1. Each cycle, call Head on the object. Compare etag with the
 //     last-seen value. Same etag → skip (the common case once the
 //     cluster is in steady state).
-//  2. Different etag (or first iteration): Get to a tempfile in the
-//     same directory as Path, chmod 0600, then os.Rename onto Path.
-//     Same-filesystem rename is atomic, so the colocated Traefik never
-//     reads a partial file.
+//  2. Different etag (or first iteration): Get the object, parse it,
+//     render PEMs to <OutDir>/versions/<id>/, swap the
+//     <OutDir>/current symlink. Same-directory rename of the symlink
+//     is atomic, so Traefik never sees a half-applied update.
 //  3. ErrNotFound on Head is tolerated — it's the first-deploy case
 //     (writer hasn't uploaded yet). Other errors retry with
 //     exponential backoff + jitter.
@@ -31,12 +43,19 @@ import (
 // cert; in steady state we Get nothing and pay one ~200-byte Head per
 // interval instead of refetching the whole blob.
 type Downloader struct {
-	Store    ObjectStore
-	Path     string
+	Store ObjectStore
+	// OutDir is the directory under which `current/` (symlink) and
+	// `versions/<id>/` snapshots live. Traefik should be pointed at
+	// `<OutDir>/current` via --providers.file.directory.
+	OutDir   string
 	Key      string
 	Interval time.Duration
 	Logger   *slog.Logger
 	Backoff  BackoffConfig // zero → defaultBackoff
+	// Keep is the number of past snapshots to retain after each
+	// successful render. Zero falls back to DefaultKeepVersions; pass a
+	// negative value to retain none.
+	Keep int
 
 	// After is a seam for tests. Production leaves it nil and the loop
 	// uses time.After; tests inject a fake clock to drive cycles
@@ -176,8 +195,21 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 		return fmt.Errorf("read body: %w", err)
 	}
 
-	if err := writeFileAtomic(d.Path, buf, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", d.Path, err)
+	certs, err := ParseAcme(buf)
+	if err != nil {
+		// A parse error is loud but recoverable: the issuer may have
+		// uploaded a transient bad file, or the format may have changed.
+		// We don't poison lastEtag — next cycle re-Gets and tries again.
+		return fmt.Errorf("parse acme.json: %w", err)
+	}
+
+	keep := d.Keep
+	if keep == 0 {
+		keep = DefaultKeepVersions
+	}
+	versionDir, pruned, err := Render(d.OutDir, certs, keep)
+	if err != nil {
+		return fmt.Errorf("render to %s: %w", d.OutDir, err)
 	}
 
 	// Prefer the Head etag (the value we'll compare on the next cycle)
@@ -189,6 +221,13 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 	}
 	d.lastEtag = newEtag
 	d.markSync(time.Now())
-	d.Logger.Info("download ok", "key", d.Key, "bytes", len(buf), "etag", newEtag, "path", d.Path)
+	d.Logger.Info("download ok",
+		"key", d.Key,
+		"bytes", len(buf),
+		"etag", newEtag,
+		"version", versionDir,
+		"certs", len(certs),
+		"pruned", len(pruned),
+	)
 	return nil
 }

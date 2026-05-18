@@ -6,8 +6,20 @@
 #     so both must land on the same node.
 #   - One `traefik` and one `certific-download` per gateway node, both
 #     `mode: global` and constrained to `role=gateway`. They share the
-#     per-node `acme-gateway` volume (one volume per gateway, not shared
+#     per-node `gateway-certs` volume (one volume per gateway, not shared
 #     between gateways).
+#
+# Cert flow:
+#   - The issuer-side Traefik owns ACME and writes /etc/acme/acme.json.
+#   - `certific upload` pushes that file to S3 on every change.
+#   - `certific download` on each gateway pulls acme.json from S3, parses
+#     it, and renders one .crt + .key per certificate plus a tls.yml under
+#     <out-dir>/current/. The `current` entry is a symlink swapped
+#     atomically at the end of each successful cycle.
+#   - Gateway Traefik runs with `--providers.file.directory=/etc/certs/current`
+#     and no certificatesResolvers at all — it cannot start an ACME flow
+#     even if its on-disk cache is missing, which is what eliminates the
+#     race that motivated this whole layout.
 #
 # Replace the placeholders before deploying:
 #   - `example-acme` with your bucket name.
@@ -74,15 +86,21 @@ services:
       - { target: 80, published: 80, protocol: tcp, mode: host }
       - { target: 443, published: 443, protocol: tcp, mode: host }
     volumes:
-      - acme-gateway:/etc/acme
+      - gateway-certs:/etc/certs
     command:
       - "--entrypoints.http.address=:80"
       - "--entrypoints.https.address=:443"
       - "--providers.swarm.endpoint=http://docker-socket-proxy:2375"
       - "--providers.swarm.exposedbydefault=false"
       - "--providers.swarm.network=certific-example_public"
-      # Gateways read acme.json as a cache only; no resolver is configured
-      # here, so no gateway can ever start an ACME flow.
+      # File provider points at the symlink certific-download swaps on
+      # every update. Traefik follows the symlink, re-scans the directory,
+      # and picks the right cert per SNI from tls.yml + the .crt files.
+      # No certificatesResolvers block is configured — this Traefik
+      # cannot start an ACME flow even if certs are missing, which is
+      # the whole point.
+      - "--providers.file.directory=/etc/certs/current"
+      - "--providers.file.watch=true"
     deploy:
       mode: global
       placement:
@@ -91,7 +109,7 @@ services:
   certific-download:
     image: ghcr.io/getlydian/certific:latest
     volumes:
-      - acme-gateway:/etc/acme
+      - gateway-certs:/etc/certs
     environment:
       - AWS_REGION=us-east-1
       - AWS_ACCESS_KEY_ID_FILE=/run/secrets/acme-gateway-aws-key-id
@@ -101,7 +119,7 @@ services:
       - acme-gateway-aws-secret
     command:
       - "--mode=download"
-      - "--path=/etc/acme/acme.json"
+      - "--out-dir=/etc/certs"
       - "--bucket=example-acme"
       - "--key=acme.json"
       - "--interval=60s"
@@ -138,7 +156,7 @@ networks:
 
 volumes:
   acme-issuer:
-  acme-gateway:
+  gateway-certs:
 
 secrets:
   acme-issuer-aws-key-id:
