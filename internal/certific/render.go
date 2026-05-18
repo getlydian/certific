@@ -219,17 +219,22 @@ func Render(baseDir string, certs []RenderedCert, keep int) (versionDir string, 
 // unrelated change inside acme.json (e.g. ACME account metadata) doesn't
 // force a re-render.
 func versionID(certs []RenderedCert) string {
+	// hash.Hash.Write never errors, but using fmt.Fprintf on it trips
+	// errcheck — write length-prefixed bytes directly instead.
 	h := sha256.New()
+	writeField := func(tag, value string) {
+		h.Write([]byte(tag))
+		h.Write([]byte{':'})
+		h.Write([]byte(value))
+		h.Write([]byte{'\n'})
+	}
 	for _, c := range certs {
-		// Length-prefix each field so concatenation can't collide.
-		fmt.Fprintf(h, "%d:%s\n", len(c.Main), c.Main)
+		writeField("main", c.Main)
 		for _, n := range c.Names {
-			fmt.Fprintf(h, "%d:%s\n", len(n), n)
+			writeField("san", n)
 		}
-		fmt.Fprintf(h, "cert:%d\n", len(c.Cert))
-		h.Write(c.Cert)
-		fmt.Fprintf(h, "key:%d\n", len(c.Key))
-		h.Write(c.Key)
+		writeField("cert", string(c.Cert))
+		writeField("key", string(c.Key))
 	}
 	sum := h.Sum(nil)
 	ts := time.Now().UTC().Format("20060102T150405Z")
