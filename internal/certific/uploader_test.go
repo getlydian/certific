@@ -269,16 +269,18 @@ func TestUploaderDedupsUnchangedContent(t *testing.T) {
 	}
 }
 
-func TestUploaderRefusesEmptyFile(t *testing.T) {
-	// Traefik briefly truncates acme.json during its atomic-write dance.
-	// If fsnotify fires inside that window we'd otherwise push 0 bytes
-	// to S3 and every gateway would re-render against nothing. The
-	// uploader must skip the Put entirely until real content lands.
+func TestUploaderRefusesInvalidJSON(t *testing.T) {
+	// Traefik's acme.json write is not atomic: it opens with O_TRUNC
+	// then writes, leaving a window where the file is 0 bytes — or, on
+	// a crash mid-write, a truncated JSON prefix. Either way an
+	// fsnotify event in that window must not propagate garbage to S3,
+	// because every gateway would then re-render against broken
+	// content.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "acme.json")
 
-	// Seed with real content so bootstrap has something to hash and the
-	// dedup path doesn't muddy this test.
+	// Seed with valid content so bootstrap has something to hash and
+	// the dedup path doesn't muddy this test.
 	seed := []byte(`{"seed":"v1"}`)
 	if err := os.WriteFile(path, seed, 0o600); err != nil {
 		t.Fatal(err)
@@ -298,17 +300,20 @@ func TestUploaderRefusesEmptyFile(t *testing.T) {
 	waitForObject(t, store, "acme.json", seed, 2*time.Second)
 	store.resetCounts()
 
-	// Now truncate to zero bytes — the empty-write window.
-	if err := os.WriteFile(path, []byte{}, 0o600); err != nil {
-		t.Fatal(err)
+	// Two bad-state cases the guard must catch: zero bytes (mid-truncate)
+	// and a truncated-prefix JSON (mid-write crash).
+	for _, payload := range [][]byte{nil, []byte(`{"partial":`)} {
+		if err := os.WriteFile(path, payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(3 * shortDebounce)
 	}
-	time.Sleep(3 * shortDebounce)
 
 	if n := putCount(store); n != 0 {
-		t.Errorf("empty file produced %d Puts, want 0", n)
+		t.Errorf("invalid JSON produced %d Puts, want 0", n)
 	}
 
-	// And confirm a subsequent real write still goes through — the
+	// And confirm a subsequent valid write still goes through — the
 	// guard must not poison future uploads.
 	next := []byte(`{"seed":"v2"}`)
 	if err := os.WriteFile(path, next, 0o600); err != nil {
@@ -359,7 +364,8 @@ func TestUploaderFiltersUnrelatedEvents(t *testing.T) {
 	// watch the directory, not the file, so other writes show up here too.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "acme.json")
-	if err := os.WriteFile(path, []byte("seed"), 0o600); err != nil {
+	seed := []byte(`{"seed":1}`)
+	if err := os.WriteFile(path, seed, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -374,7 +380,7 @@ func TestUploaderFiltersUnrelatedEvents(t *testing.T) {
 	cancel, done := startUploader(t, u)
 	defer func() { cancel(); <-done }()
 
-	waitForObject(t, store, "acme.json", []byte("seed"), 2*time.Second)
+	waitForObject(t, store, "acme.json", seed, 2*time.Second)
 	store.resetCounts()
 
 	sibling := filepath.Join(dir, "noise.txt")
@@ -397,7 +403,8 @@ func TestUploaderHandlesAtomicRename(t *testing.T) {
 	// notice it; this test pins that behaviour.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "acme.json")
-	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+	old := []byte(`{"v":"old"}`)
+	if err := os.WriteFile(path, old, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -412,7 +419,7 @@ func TestUploaderHandlesAtomicRename(t *testing.T) {
 	cancel, done := startUploader(t, u)
 	defer func() { cancel(); <-done }()
 
-	waitForObject(t, store, "acme.json", []byte("old"), 2*time.Second)
+	waitForObject(t, store, "acme.json", old, 2*time.Second)
 
 	tmp := filepath.Join(dir, "acme.json.new")
 	payload := []byte(`{"renamed":"in"}`)
@@ -432,7 +439,8 @@ func TestUploaderCancellationReturns(t *testing.T) {
 	// debounce timer or a phantom upload.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "acme.json")
-	if err := os.WriteFile(path, []byte("seed"), 0o600); err != nil {
+	seed := []byte(`{"seed":"cancel"}`)
+	if err := os.WriteFile(path, seed, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -447,7 +455,7 @@ func TestUploaderCancellationReturns(t *testing.T) {
 	cancel, done := startUploader(t, u)
 
 	// Let bootstrap + initial-upload settle so we're parked on the select.
-	waitForObject(t, store, "acme.json", []byte("seed"), 2*time.Second)
+	waitForObject(t, store, "acme.json", seed, 2*time.Second)
 
 	cancel()
 	select {

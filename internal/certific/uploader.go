@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -255,14 +256,21 @@ func (u *Uploader) uploadWithRetry(ctx context.Context, backoff BackoffConfig) {
 		}
 		return
 	}
-	if len(bytes.TrimSpace(buf)) == 0 {
-		// Refuse to push an empty acme.json to S3. Traefik briefly
-		// truncates the file during its atomic write dance, and an
-		// fsnotify event firing in that window would otherwise propagate
-		// 0 bytes to every gateway — wiping their snapshots. The next
-		// fsnotify event (the rename of the new file into place) will
-		// re-trigger this path with real content.
-		u.Logger.Warn("upload: refusing to push empty acme.json", "path", u.Path, "bytes", len(buf))
+	if !json.Valid(buf) {
+		// Refuse to push non-JSON content. Traefik's acme.json write is
+		// not atomic: it opens with O_TRUNC, then writes — leaving a
+		// real window in which the file on disk is 0 bytes (or, on
+		// crash mid-write, a truncated prefix). An fsnotify event in
+		// that window would otherwise propagate garbage to every
+		// gateway. The next fsnotify event (the completing write, or
+		// the next legitimate renewal) re-triggers this path with
+		// valid content.
+		//
+		// Hand-edited or genuinely corrupt acme.json reaches this
+		// branch too and stays there until a human fixes it — exactly
+		// what we want, since silently uploading broken JSON would
+		// invalidate every gateway's snapshot.
+		u.Logger.Warn("upload: refusing to push non-JSON acme.json", "path", u.Path, "bytes", len(buf))
 		return
 	}
 	hash := sha256.Sum256(buf)
