@@ -527,12 +527,13 @@ func TestDownloaderPrunesOldSnapshots(t *testing.T) {
 		if err := store.Put(context.Background(), "acme.json", bytes.NewReader(body), int64(len(body))); err != nil {
 			t.Fatal(err)
 		}
-		if i == 0 {
-			// First cycle fires immediately on Run; no tick needed.
-		} else {
-			clock.waitForWaiter(t)
-			clock.tick()
-		}
+		// Wait for the loop's After waiter to register before ticking.
+		// On i=0 the immediate-first cycle has typically already raced
+		// past our Put and 404'd, so we still need a tick to pick up the
+		// freshly-staged payload — the 404 path leaves lastEtag empty,
+		// so the next Head will trigger a Get.
+		clock.waitForWaiter(t)
+		clock.tick()
 		// Each render embeds a wall-clock second in the version id, so
 		// without this pause two consecutive renders can land in the
 		// same id and short-circuit to "directory already exists" —
