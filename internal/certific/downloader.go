@@ -1,6 +1,7 @@
 package certific
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -199,6 +200,15 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 	buf, err := io.ReadAll(body)
 	if err != nil {
 		return fmt.Errorf("read body: %w", err)
+	}
+
+	if len(bytes.TrimSpace(buf)) == 0 {
+		// Empty body from S3: the uploader (or whatever wrote the object)
+		// produced a zero-byte file. Treat like first-deploy — render an
+		// empty snapshot so `current` exists, and don't poison lastEtag
+		// so the next non-empty upload still triggers a re-render.
+		d.Logger.Warn("download: acme.json is empty, rendering empty snapshot", "key", d.Key, "bytes", len(buf))
+		return d.renderEmpty()
 	}
 
 	certs, err := ParseAcme(buf)

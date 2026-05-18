@@ -335,6 +335,43 @@ func TestDownloaderTolerates404OnFirstCycle(t *testing.T) {
 	waitForRendered(t, outDir, "finally.example", []byte("therecert"), 2*time.Second)
 }
 
+func TestDownloaderToleratesEmptyAcmeJSON(t *testing.T) {
+	// An uploader bug (or a bad hand-edit) can land 0 bytes in S3.
+	// Without a guard, the downloader retries-forever on
+	// "unexpected end of JSON input" and never renders <OutDir>/current,
+	// stranding Traefik. Empty body should be treated like first-deploy.
+	outDir := t.TempDir()
+
+	store := newFakeStore()
+	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(nil), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	clock := newFakeClock()
+	d := &Downloader{
+		Store:    store,
+		OutDir:   outDir,
+		Key:      "acme.json",
+		Interval: 60 * time.Second,
+		Backoff:  fastBackoff,
+		After:    clock.After,
+	}
+	cancel, done := startDownloader(t, d)
+	defer func() { cancel(); <-done }()
+
+	waitForEmptySnapshot(t, outDir, 2*time.Second)
+
+	// Once real content lands, the downloader must pick it up — the
+	// empty-body branch must not poison lastEtag.
+	clock.waitForWaiter(t)
+	payload := buildAcmeJSON("dns", fakeCert{main: "later.example", cert: []byte("realcert"), key: []byte("realkey")})
+	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Fatal(err)
+	}
+	clock.tick()
+	waitForRendered(t, outDir, "later.example", []byte("realcert"), 2*time.Second)
+}
+
 func TestDownloaderRetriesOnTransientError(t *testing.T) {
 	// S3 hiccups during a cycle must not crash the downloader. cycle()
 	// retries within the same tick using backoff; we verify the file

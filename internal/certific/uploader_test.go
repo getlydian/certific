@@ -269,6 +269,54 @@ func TestUploaderDedupsUnchangedContent(t *testing.T) {
 	}
 }
 
+func TestUploaderRefusesEmptyFile(t *testing.T) {
+	// Traefik briefly truncates acme.json during its atomic-write dance.
+	// If fsnotify fires inside that window we'd otherwise push 0 bytes
+	// to S3 and every gateway would re-render against nothing. The
+	// uploader must skip the Put entirely until real content lands.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "acme.json")
+
+	// Seed with real content so bootstrap has something to hash and the
+	// dedup path doesn't muddy this test.
+	seed := []byte(`{"seed":"v1"}`)
+	if err := os.WriteFile(path, seed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := newFakeStore()
+	u := &Uploader{
+		Store:    store,
+		Path:     path,
+		Key:      "acme.json",
+		Debounce: shortDebounce,
+		Backoff:  fastBackoff,
+	}
+	cancel, done := startUploader(t, u)
+	defer func() { cancel(); <-done }()
+
+	waitForObject(t, store, "acme.json", seed, 2*time.Second)
+	store.resetCounts()
+
+	// Now truncate to zero bytes — the empty-write window.
+	if err := os.WriteFile(path, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * shortDebounce)
+
+	if n := putCount(store); n != 0 {
+		t.Errorf("empty file produced %d Puts, want 0", n)
+	}
+
+	// And confirm a subsequent real write still goes through — the
+	// guard must not poison future uploads.
+	next := []byte(`{"seed":"v2"}`)
+	if err := os.WriteFile(path, next, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForObject(t, store, "acme.json", next, 2*time.Second)
+}
+
 func TestUploaderRetriesOnPutError(t *testing.T) {
 	// S3 transient failures must not crash the watch loop. We arrange for
 	// the first two Puts to fail and the third to succeed, then assert
