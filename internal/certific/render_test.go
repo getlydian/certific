@@ -140,14 +140,25 @@ func TestRenderWritesPEMsAndTLSYAML(t *testing.T) {
 		}
 	}
 
-	// tls.yml lists both certs.
+	// tls.yml lists both certs by absolute path through `current`.
+	// Bare filenames don't work — Traefik resolves relative certFile
+	// paths against its process CWD, not the directory containing the
+	// dynamic config, and silently fails with a misleading "unable to
+	// parse certificate" error. Lock in the path shape so the bug can't
+	// regress to bare filenames.
 	tlsYml, err := os.ReadFile(filepath.Join(dir, "current", "tls.yml"))
 	if err != nil {
 		t.Fatalf("read tls.yml: %v", err)
 	}
+	currentDir := filepath.Join(dir, "current")
 	for _, c := range certs {
-		if !bytes.Contains(tlsYml, []byte(c.Main+".crt")) {
-			t.Errorf("tls.yml missing %s.crt entry", c.Main)
+		wantCert := fmt.Sprintf("certFile: %s\n", filepath.Join(currentDir, c.Main+".crt"))
+		wantKey := fmt.Sprintf("keyFile: %s\n", filepath.Join(currentDir, c.Main+".key"))
+		if !bytes.Contains(tlsYml, []byte(wantCert)) {
+			t.Errorf("tls.yml missing absolute certFile entry %q; got:\n%s", wantCert, tlsYml)
+		}
+		if !bytes.Contains(tlsYml, []byte(wantKey)) {
+			t.Errorf("tls.yml missing absolute keyFile entry %q; got:\n%s", wantKey, tlsYml)
 		}
 	}
 }
