@@ -47,8 +47,7 @@ const DefaultHealthGrace = 24 * time.Hour
 // Path and OutDir are mode-specific:
 //   - Upload watches Path (the issuer's acme.json) and ignores OutDir.
 //   - Download writes rendered cert PEMs and tls.yml under OutDir
-//     (a directory containing `current/` symlink and `versions/`)
-//     and ignores Path.
+//     (into a watched `live/` directory) and ignores Path.
 //
 // They're kept as separate fields rather than reusing Path so error
 // messages can name the right flag and so a mistaken Path on a
@@ -57,8 +56,8 @@ const DefaultHealthGrace = 24 * time.Hour
 type Config struct {
 	Mode        Mode
 	Path        string // upload mode: input acme.json file
-	OutDir      string // download mode: output dir for rendered cert PEMs + tls.yml
-	Keep        int    // download mode: snapshots to retain (0 → DefaultKeepVersions)
+	OutDir      string // download mode: output dir for rendered cert PEMs + tls.yml (written into <OutDir>/live)
+	Keep        int    // download mode: DEPRECATED, ignored — no local snapshots are kept
 	Bucket      string
 	Key         string
 	Region      string
@@ -111,8 +110,8 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 	logStr := cfg.LogLevel.String()
 	fs.StringVar(&modeStr, "mode", modeStr, "run mode: upload|download (CERTIFIC_MODE)")
 	fs.StringVar(&cfg.Path, "path", cfg.Path, "upload mode: local acme.json path (CERTIFIC_PATH)")
-	fs.StringVar(&cfg.OutDir, "out-dir", cfg.OutDir, "download mode: output dir for rendered cert PEMs + tls.yml; gateway Traefik points its file provider at <out-dir>/current (CERTIFIC_OUT_DIR)")
-	keepFlag := fs.String("keep", "", "download mode: number of past rendered snapshots to retain (CERTIFIC_KEEP, default 2)")
+	fs.StringVar(&cfg.OutDir, "out-dir", cfg.OutDir, "download mode: output dir for rendered cert PEMs + tls.yml; gateway Traefik points its file provider at <out-dir>/live (CERTIFIC_OUT_DIR)")
+	keepFlag := fs.String("keep", "", "download mode: DEPRECATED and ignored — certific no longer keeps local snapshots (CERTIFIC_KEEP)")
 	fs.StringVar(&cfg.Bucket, "bucket", cfg.Bucket, "S3 bucket name (CERTIFIC_BUCKET)")
 	fs.StringVar(&cfg.Key, "key", cfg.Key, "S3 object key (CERTIFIC_KEY)")
 	fs.StringVar(&cfg.Region, "region", cfg.Region, "S3 region (CERTIFIC_REGION)")

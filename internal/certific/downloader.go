@@ -11,16 +11,11 @@ import (
 	"time"
 )
 
-// DefaultKeepVersions is the number of past rendered snapshots retained
-// under <OutDir>/versions/ after a successful swap. One is enough to roll
-// back manually if a bad acme.json reaches gateways; more is wasted disk.
-const DefaultKeepVersions = 2
-
 // Downloader polls S3 for changes to acme.json and, when the remote
 // etag changes, fetches it, parses it into per-domain cert/key PEMs,
-// and atomically swaps a `current` symlink under OutDir to point at the
-// new versioned snapshot. Traefik's file provider, pointed at
-// <OutDir>/current, sees a consistent directory at all times.
+// and reconciles them in place into <OutDir>/live/. Traefik's file
+// provider, pointed at <OutDir>/live with watch=true, sees each change
+// as an inotify event and reloads on its own.
 //
 // The gateway-side Traefik has NO certificatesResolvers configured — it
 // can't even attempt ACME. It only loads the cert files the file
@@ -33,32 +28,27 @@ const DefaultKeepVersions = 2
 //     last-seen value. Same etag → skip (the common case once the
 //     cluster is in steady state).
 //  2. Different etag (or first iteration): Get the object, parse it,
-//     render PEMs to <OutDir>/versions/<id>/, swap the
-//     <OutDir>/current symlink. Same-directory rename of the symlink
-//     is atomic, so Traefik never sees a half-applied update.
+//     render PEMs into <OutDir>/live/ via atomic in-place renames (see
+//     Render). Traefik never sees a half-applied update, and a
+//     freshly-issued cert is served as soon as the reload fires.
 //  3. ErrNotFound on Head/Get is tolerated — it's the first-deploy case
-//     (writer hasn't uploaded yet). We render an empty snapshot so
-//     <OutDir>/current still exists; Traefik's file provider needs a
-//     directory to start against. Other errors retry with exponential
-//     backoff + jitter.
+//     (writer hasn't uploaded yet). We render an empty live/ dir so it
+//     still exists; Traefik's file provider needs a directory to start
+//     against. Other errors retry with exponential backoff + jitter.
 //
 // "Head before Get" matters because acme.json grows with every issued
 // cert; in steady state we Get nothing and pay one ~200-byte Head per
 // interval instead of refetching the whole blob.
 type Downloader struct {
 	Store ObjectStore
-	// OutDir is the directory under which `current/` (symlink) and
-	// `versions/<id>/` snapshots live. Traefik should be pointed at
-	// `<OutDir>/current` via --providers.file.directory.
+	// OutDir is the directory under which the watched `live/` directory
+	// (and a `.staging/` scratch dir) live. Traefik should be pointed at
+	// `<OutDir>/live` via --providers.file.directory.
 	OutDir   string
 	Key      string
 	Interval time.Duration
 	Logger   *slog.Logger
 	Backoff  BackoffConfig // zero → defaultBackoff
-	// Keep is the number of past snapshots to retain after each
-	// successful render. Zero falls back to DefaultKeepVersions; pass a
-	// negative value to retain none.
-	Keep int
 
 	// After is a seam for tests. Production leaves it nil and the loop
 	// uses time.After; tests inject a fake clock to drive cycles
@@ -173,7 +163,7 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			// First-deploy: writer hasn't uploaded acme.json yet. Render
-			// an empty snapshot so <OutDir>/current exists and Traefik's
+			// an empty live/ dir so <OutDir>/live exists and Traefik's
 			// file provider can start with an empty tls.certificates
 			// list. Without this, a gateway pointed at a not-yet-extant
 			// directory hangs on startup (or, with a directory-existence
@@ -205,9 +195,9 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 	if len(bytes.TrimSpace(buf)) == 0 {
 		// Empty body from S3: the uploader (or whatever wrote the object)
 		// produced a zero-byte file. Treat like first-deploy — render an
-		// empty snapshot so `current` exists, and don't poison lastEtag
+		// empty live/ dir so <OutDir>/live exists, and don't poison lastEtag
 		// so the next non-empty upload still triggers a re-render.
-		d.Logger.Warn("download: acme.json is empty, rendering empty snapshot", "key", d.Key, "bytes", len(buf))
+		d.Logger.Warn("download: acme.json is empty, rendering empty live dir", "key", d.Key, "bytes", len(buf))
 		return d.renderEmpty()
 	}
 
@@ -219,11 +209,7 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 		return fmt.Errorf("parse acme.json: %w", err)
 	}
 
-	keep := d.Keep
-	if keep == 0 {
-		keep = DefaultKeepVersions
-	}
-	versionDir, pruned, err := Render(d.OutDir, certs, keep)
+	changed, err := Render(d.OutDir, certs)
 	if err != nil {
 		return fmt.Errorf("render to %s: %w", d.OutDir, err)
 	}
@@ -241,39 +227,32 @@ func (d *Downloader) tryCycle(ctx context.Context) error {
 		"key", d.Key,
 		"bytes", len(buf),
 		"etag", newEtag,
-		"version", versionDir,
 		"certs", len(certs),
-		"pruned", len(pruned),
+		"changed", changed,
 	)
 	return nil
 }
 
-// renderEmpty writes a versioned snapshot with no certs and points
-// `current` at it. Used when acme.json is missing or contains no usable
-// certs: Traefik still needs <OutDir>/current to exist so the file
-// provider can load (an empty tls.certificates list is valid).
+// renderEmpty reconciles <OutDir>/live/ to hold no certs (just an empty
+// tls.yml). Used when acme.json is missing or contains no usable certs:
+// Traefik still needs <OutDir>/live to exist so the file provider can load
+// (an empty tls.certificates list is valid).
 //
 // lastEtag stays empty so the very next cycle re-Heads and re-Gets once
-// the writer uploads — the Render call is content-addressed, so calling
-// it repeatedly with the same empty input is a cheap no-op after the
-// first one.
+// the writer uploads — Render skips unchanged files, so calling it
+// repeatedly with the same empty input touches nothing and fires no
+// inotify event after the first call.
 func (d *Downloader) renderEmpty() error {
-	keep := d.Keep
-	if keep == 0 {
-		keep = DefaultKeepVersions
-	}
-	versionDir, _, err := Render(d.OutDir, nil, keep)
-	if err != nil {
-		return fmt.Errorf("render empty snapshot to %s: %w", d.OutDir, err)
+	if _, err := Render(d.OutDir, nil); err != nil {
+		return fmt.Errorf("render empty live dir to %s: %w", d.OutDir, err)
 	}
 	d.markSync(time.Now())
 	// Debug-level: this fires every cycle while acme.json is missing or
 	// empty, and the first-deploy state can persist indefinitely. Render
-	// itself is a content-addressed no-op after the first call, so the
-	// log line is the only per-cycle cost worth suppressing.
-	d.Logger.Debug("download: no certs yet, re-rendered empty snapshot (idempotent)",
+	// itself is a no-op once live/ already matches, so the log line is the
+	// only per-cycle cost worth suppressing.
+	d.Logger.Debug("download: no certs yet, live dir reconciled empty (idempotent)",
 		"key", d.Key,
-		"version", versionDir,
 	)
 	return nil
 }

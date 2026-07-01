@@ -130,13 +130,13 @@ func buildAcmeJSON(resolver string, certs ...fakeCert) []byte {
 	return b.Bytes()
 }
 
-// waitForRendered polls until <outDir>/current/<slug>.crt contains want,
-// or the deadline expires. The downloader rewrites the symlink atomically
-// at the end of each successful cycle, so any read through `current/`
-// either sees the previous snapshot or the new one — never a partial.
+// waitForRendered polls until <outDir>/live/<slug>.crt contains want, or
+// the deadline expires. The downloader renames each cert file into live/
+// atomically, so any read either sees the previous bytes or the new ones —
+// never a partial.
 func waitForRendered(t *testing.T, outDir, slug string, want []byte, deadline time.Duration) {
 	t.Helper()
-	path := filepath.Join(outDir, "current", slug+".crt")
+	path := filepath.Join(outDir, LiveDirName, slug+".crt")
 	end := time.Now().Add(deadline)
 	for time.Now().Before(end) {
 		got, err := os.ReadFile(path)
@@ -148,13 +148,13 @@ func waitForRendered(t *testing.T, outDir, slug string, want []byte, deadline ti
 	t.Fatalf("timed out waiting for %s to equal %d bytes", path, len(want))
 }
 
-// waitForEmptySnapshot polls until <outDir>/current resolves to a
-// directory whose tls.yml lists no certificates. Used after a
-// 404-on-first-cycle to confirm we still produced a directory Traefik
-// can start against — even though no certs have been issued yet.
+// waitForEmptySnapshot polls until <outDir>/live holds a tls.yml that
+// lists no certificates. Used after a 404-on-first-cycle to confirm we
+// still produced a directory Traefik can start against — even though no
+// certs have been issued yet.
 func waitForEmptySnapshot(t *testing.T, outDir string, deadline time.Duration) {
 	t.Helper()
-	tlsPath := filepath.Join(outDir, "current", "tls.yml")
+	tlsPath := filepath.Join(outDir, LiveDirName, "tls.yml")
 	end := time.Now().Add(deadline)
 	for time.Now().Before(end) {
 		body, err := os.ReadFile(tlsPath)
@@ -163,12 +163,12 @@ func waitForEmptySnapshot(t *testing.T, outDir string, deadline time.Duration) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for empty snapshot at %s", tlsPath)
+	t.Fatalf("timed out waiting for empty live dir at %s", tlsPath)
 }
 
 func TestDownloaderFirstCycleRendersCerts(t *testing.T) {
 	// Boot path: object is already in S3 (writer ran first). Downloader
-	// must fetch and render to <OutDir>/current on its first cycle
+	// must fetch and render to <OutDir>/live on its first cycle
 	// without waiting for an interval.
 	outDir := t.TempDir()
 
@@ -196,10 +196,9 @@ func TestDownloaderFirstCycleRendersCerts(t *testing.T) {
 
 	waitForRendered(t, outDir, "example.com", []byte("---cert-bytes---"), 2*time.Second)
 
-	// tls.yml should reference the rendered cert by relative filename so
-	// Traefik's file provider, pointed at <outDir>/current, can load it
-	// without any path translation.
-	tlsYml, err := os.ReadFile(filepath.Join(outDir, "current", "tls.yml"))
+	// tls.yml should reference the rendered cert so Traefik's file
+	// provider, pointed at <outDir>/live, can load it.
+	tlsYml, err := os.ReadFile(filepath.Join(outDir, LiveDirName, "tls.yml"))
 	if err != nil {
 		t.Fatalf("read tls.yml: %v", err)
 	}
@@ -435,7 +434,7 @@ func TestDownloaderWritesMode0600(t *testing.T) {
 	waitForRendered(t, outDir, "secret.example", []byte("cert"), 2*time.Second)
 
 	for _, name := range []string{"secret.example.crt", "secret.example.key", "tls.yml"} {
-		info, err := os.Stat(filepath.Join(outDir, "current", name))
+		info, err := os.Stat(filepath.Join(outDir, LiveDirName, name))
 		if err != nil {
 			t.Fatalf("stat %s: %v", name, err)
 		}
@@ -445,13 +444,11 @@ func TestDownloaderWritesMode0600(t *testing.T) {
 	}
 }
 
-func TestDownloaderAtomicSwap(t *testing.T) {
-	// Verify the symlink-swap pattern by pre-populating OutDir with an
-	// older snapshot pointed-at by `current`. After a successful cycle,
-	// `current` must still resolve to a populated, internally-consistent
-	// directory (no half-written tls.yml). We approximate atomicity by
-	// checking that `current` is a symlink targeting a `versions/<id>/`
-	// dir, and that no `.tmp` staging dirs remain after success.
+func TestDownloaderRendersIntoLiveDir(t *testing.T) {
+	// The watched directory must be a real directory, not a symlink:
+	// Traefik's directory watch only fires on events inside a real dir,
+	// which is the whole reason for the in-place design. Also assert the
+	// staging dir is left clean (no leaked temp files) after a cycle.
 	outDir := t.TempDir()
 
 	store := newFakeStore()
@@ -474,25 +471,24 @@ func TestDownloaderAtomicSwap(t *testing.T) {
 
 	waitForRendered(t, outDir, "first.example", []byte("a"), 2*time.Second)
 
-	// current must be a symlink, not a real directory — that's the
-	// whole atomicity contract.
-	info, err := os.Lstat(filepath.Join(outDir, "current"))
+	info, err := os.Lstat(filepath.Join(outDir, LiveDirName))
 	if err != nil {
-		t.Fatalf("lstat current: %v", err)
+		t.Fatalf("lstat live: %v", err)
 	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Errorf("current is not a symlink (mode=%v)", info.Mode())
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("live/ is a symlink (mode=%v); must be a real directory", info.Mode())
+	}
+	if !info.IsDir() {
+		t.Errorf("live/ is not a directory (mode=%v)", info.Mode())
 	}
 
-	// No leftover .tmp staging dirs after the cycle.
-	entries, err := os.ReadDir(filepath.Join(outDir, "versions"))
+	// Staging must be clean after a successful render.
+	entries, err := os.ReadDir(filepath.Join(outDir, stagingDirName))
 	if err != nil {
-		t.Fatalf("read versions: %v", err)
+		t.Fatalf("read staging: %v", err)
 	}
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) == ".tmp" {
-			t.Errorf("leftover staging dir: %s", e.Name())
-		}
+	if len(entries) != 0 {
+		t.Errorf("staging dir not empty after cycle: %d entries", len(entries))
 	}
 }
 
@@ -539,11 +535,10 @@ func TestDownloaderRejectsZeroInterval(t *testing.T) {
 	}
 }
 
-func TestDownloaderPrunesOldSnapshots(t *testing.T) {
-	// After three distinct renders with Keep=1, `versions/` should
-	// contain at most two dirs: the active one and one prior. Sanity
-	// check on the prune wiring; full prune logic is exercised by
-	// render_test.go.
+func TestDownloaderPrunesRemovedCert(t *testing.T) {
+	// A host present in one acme.json but gone from the next must have its
+	// key material removed from live/ on the next cycle — a decommissioned
+	// domain's private key must not linger on gateways.
 	outDir := t.TempDir()
 	store := newFakeStore()
 	clock := newFakeClock()
@@ -554,49 +549,42 @@ func TestDownloaderPrunesOldSnapshots(t *testing.T) {
 		Interval: 60 * time.Second,
 		Backoff:  fastBackoff,
 		After:    clock.After,
-		Keep:     1,
 	}
 	cancel, done := startDownloader(t, d)
 	defer func() { cancel(); <-done }()
 
-	for i, body := range [][]byte{
-		buildAcmeJSON("dns", fakeCert{main: "a.example", cert: []byte("a1"), key: []byte("k1")}),
-		buildAcmeJSON("dns", fakeCert{main: "a.example", cert: []byte("a2"), key: []byte("k2")}),
-		buildAcmeJSON("dns", fakeCert{main: "a.example", cert: []byte("a3"), key: []byte("k3")}),
-	} {
-		if err := store.Put(context.Background(), "acme.json", bytes.NewReader(body), int64(len(body))); err != nil {
-			t.Fatal(err)
-		}
-		// Wait for the loop's After waiter to register before ticking.
-		// On i=0 the immediate-first cycle has typically already raced
-		// past our Put and 404'd, so we still need a tick to pick up the
-		// freshly-staged payload — the 404 path leaves lastEtag empty,
-		// so the next Head will trigger a Get.
-		clock.waitForWaiter(t)
-		clock.tick()
-		// Each render embeds a wall-clock second in the version id, so
-		// without this pause two consecutive renders can land in the
-		// same id and short-circuit to "directory already exists" —
-		// which is correct behaviour but defeats the test.
-		time.Sleep(1100 * time.Millisecond)
-		// Wait for the cert from this iteration to be the active one.
-		wantCert := []byte(fmt.Sprintf("a%d", i+1))
-		waitForRendered(t, outDir, "a.example", wantCert, 2*time.Second)
-	}
-
-	entries, err := os.ReadDir(filepath.Join(outDir, "versions"))
-	if err != nil {
+	// First upload carries two certs.
+	two := buildAcmeJSON("dns",
+		fakeCert{main: "keep.example", cert: []byte("kc"), key: []byte("kk")},
+		fakeCert{main: "drop.example", cert: []byte("dc"), key: []byte("dk")},
+	)
+	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(two), int64(len(two))); err != nil {
 		t.Fatal(err)
 	}
-	var dirs int
-	for _, e := range entries {
-		if e.IsDir() && filepath.Ext(e.Name()) != ".tmp" {
-			dirs++
-		}
+	waitForRendered(t, outDir, "drop.example", []byte("dc"), 2*time.Second)
+
+	// Second upload drops one cert → new etag → re-render prunes it.
+	one := buildAcmeJSON("dns", fakeCert{main: "keep.example", cert: []byte("kc"), key: []byte("kk")})
+	if err := store.Put(context.Background(), "acme.json", bytes.NewReader(one), int64(len(one))); err != nil {
+		t.Fatal(err)
 	}
-	// active + Keep=1 prior = 2 expected.
-	if dirs > 2 {
-		t.Errorf("versions/ contains %d dirs, want ≤ 2 with Keep=1", dirs)
+	clock.waitForWaiter(t)
+	clock.tick()
+
+	// Poll until drop.example.crt is gone.
+	dropped := filepath.Join(outDir, LiveDirName, "drop.example.crt")
+	end := time.Now().Add(2 * time.Second)
+	for time.Now().Before(end) {
+		if _, err := os.Stat(dropped); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if _, err := os.Stat(dropped); !os.IsNotExist(err) {
+		t.Errorf("drop.example.crt not pruned, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, LiveDirName, "keep.example.crt")); err != nil {
+		t.Errorf("keep.example.crt should survive: %v", err)
 	}
 }
 

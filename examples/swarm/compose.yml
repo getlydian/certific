@@ -13,10 +13,11 @@
 #   - The issuer-side Traefik owns ACME and writes /etc/acme/acme.json.
 #   - `certific upload` pushes that file to S3 on every change.
 #   - `certific download` on each gateway pulls acme.json from S3, parses
-#     it, and renders one .crt + .key per certificate plus a tls.yml under
-#     <out-dir>/current/. The `current` entry is a symlink swapped
-#     atomically at the end of each successful cycle.
-#   - Gateway Traefik runs with `--providers.file.directory=/etc/certs/current`
+#     it, and renders one .crt + .key per certificate plus a tls.yml in
+#     place into <out-dir>/live/. Each file is staged in a sibling dir and
+#     atomically renamed into live/, so Traefik's directory watch fires and
+#     it reloads on its own — no symlink swap, no restart.
+#   - Gateway Traefik runs with `--providers.file.directory=/etc/certs/live`
 #     and no certificatesResolvers at all — it cannot start an ACME flow
 #     even if its on-disk cache is missing, which is what eliminates the
 #     race that motivated this whole layout.
@@ -93,13 +94,13 @@ services:
       - "--providers.swarm.endpoint=http://docker-socket-proxy:2375"
       - "--providers.swarm.exposedbydefault=false"
       - "--providers.swarm.network=certific-example_public"
-      # File provider points at the symlink certific-download swaps on
-      # every update. Traefik follows the symlink, re-scans the directory,
-      # and picks the right cert per SNI from tls.yml + the .crt files.
-      # No certificatesResolvers block is configured — this Traefik
-      # cannot start an ACME flow even if certs are missing, which is
-      # the whole point.
-      - "--providers.file.directory=/etc/certs/current"
+      # File provider watches this real directory directly. certific-download
+      # writes cert material into it in place (atomic renames), so Traefik's
+      # watch fires, it re-scans, and picks the right cert per SNI from
+      # tls.yml + the .crt files. No certificatesResolvers block is
+      # configured — this Traefik cannot start an ACME flow even if certs
+      # are missing, which is the whole point.
+      - "--providers.file.directory=/etc/certs/live"
       - "--providers.file.watch=true"
     deploy:
       mode: global

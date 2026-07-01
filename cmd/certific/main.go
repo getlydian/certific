@@ -122,12 +122,20 @@ func runDownload(ctx context.Context, cfg certific.Config, logger *slog.Logger) 
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
+	if cfg.Keep != 0 {
+		// --keep / CERTIFIC_KEEP retained versioned snapshots under
+		// <out-dir>/versions/. The downloader now writes cert material in
+		// place into <out-dir>/live/ (so Traefik's directory watch fires
+		// on rotation) and keeps no local history — rollback is served by
+		// S3 object versioning. Accept the flag so existing deploys don't
+		// fail to start, but it no longer does anything.
+		logger.Warn("--keep/CERTIFIC_KEEP is deprecated and ignored: certific no longer keeps local snapshots", "keep", cfg.Keep)
+	}
 	d := &certific.Downloader{
 		Store:    store,
 		OutDir:   cfg.OutDir,
 		Key:      cfg.Key,
 		Interval: cfg.Interval,
-		Keep:     cfg.Keep,
 		Logger:   logger,
 	}
 	// Downloader's freshness budget is 2×interval: one interval to

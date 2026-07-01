@@ -35,10 +35,11 @@ ACME state.
 - `certific upload` pushes the issuer's `acme.json` to S3 on every change.
 - `certific download` on each gateway pulls `acme.json` from S3, parses
   it, and renders one `.crt` + `.key` per certificate plus a `tls.yml`
-  index into a versioned snapshot under `<out-dir>/versions/<id>/`.
-  After each successful render it atomically swaps `<out-dir>/current`
-  (a symlink) to point at the new snapshot.
-- Gateway Traefik runs with `--providers.file.directory=<out-dir>/current`
+  index **in place** into a fixed real directory `<out-dir>/live/`. Each
+  file is written to a sibling staging dir and atomically `rename`d into
+  `live/`, so Traefik never observes a half-written file and its directory
+  watch fires on every change and reloads on its own.
+- Gateway Traefik runs with `--providers.file.directory=<out-dir>/live`
   and **no `certificatesResolvers` block at all**. It physically cannot
   start an ACME flow even if the directory is empty — a cache miss on a
   brand-new domain fails the TLS handshake on that one gateway until the
@@ -60,13 +61,20 @@ issuer Traefik starts with a warm cache.
 
 In `download` mode it polls S3 on `--interval`, `HEAD`s first so an
 unchanged object never re-downloads, parses the fetched bytes into
-per-domain PEM cert/key pairs, writes them to a new
-`<out-dir>/versions/<id>/` snapshot alongside a `tls.yml` Traefik
-dynamic config that lists them, then renames a sibling `current.new`
-symlink onto `current`. Same-directory symlink rename is atomic on
-POSIX filesystems, so the gateway Traefik never sees a half-applied
-update. All output files are `chmod 0600` because they contain private
-keys; older snapshots are pruned to `--keep` (default 2).
+per-domain PEM cert/key pairs, and reconciles the fixed `<out-dir>/live/`
+directory to hold exactly those certs plus a `tls.yml` Traefik dynamic
+config that lists them. Each file is written to a sibling `<out-dir>/.staging/`
+dir (outside the watched directory, same filesystem) and atomically
+`rename`d into `live/`, so Traefik never sees a partial file and no temp
+file is ever visible in `live/`. Writes are ordered for consistency: all
+`.crt`/`.key` files first, `tls.yml` last (a reload before it still reads
+the old index, which only names files already on disk), and files for
+removed certs are pruned only after `tls.yml` has stopped referencing
+them. Unchanged files are skipped by content compare, so re-rendering
+identical input touches nothing and fires no inotify event — an idle
+gateway never churns Traefik. All output files are `chmod 0600` because
+they contain private keys. There are no local snapshots: rollback is
+served by S3 object versioning on the bucket.
 
 Both modes back off with jitter on transient S3 errors and keep running.
 Downstream Traefiks keep serving the last good cert until S3 recovers.
@@ -120,7 +128,7 @@ docker service create \
   --publish published=80,target=80 \
   --mount type=volume,source=gateway-certs,target=/etc/certs \
   traefik:v3.6 \
-  --providers.file.directory=/etc/certs/current \
+  --providers.file.directory=/etc/certs/live \
   --providers.file.watch=true
 
 docker service create \
@@ -143,8 +151,8 @@ The issuer-side `traefik` and `certific upload` share the `acme-issuer`
 volume on the same node. The gateway-side `traefik` and `certific
 download` share the per-node `gateway-certs` volume (one volume per
 gateway node — they don't share state between gateways). Traefik's
-file provider follows the `current` symlink and reloads when its
-target changes.
+file provider watches `/etc/certs/live` directly and reloads when
+`certific download` writes into it.
 
 A worked compose example lives at
 [examples/swarm/compose.yml](examples/swarm/compose.yml) and covers the
@@ -162,8 +170,8 @@ upload and download sidecars.
 | ---- | --- | ----- | ------- | ----------- |
 | `--mode` | `CERTIFIC_MODE` | both | _required_ | `upload` or `download`. |
 | `--path` | `CERTIFIC_PATH` | upload | _required_ | Local path to the issuer's `acme.json`. Rejected on download. |
-| `--out-dir` | `CERTIFIC_OUT_DIR` | download | _required_ | Output directory; rendered snapshots land at `<out-dir>/versions/<id>/` and the active one is symlinked from `<out-dir>/current`. Point Traefik's file provider at `<out-dir>/current`. Rejected on upload. |
-| `--keep` | `CERTIFIC_KEEP` | download | `2` | Number of past snapshots to retain after each render. |
+| `--out-dir` | `CERTIFIC_OUT_DIR` | download | _required_ | Output directory. Cert PEMs and `tls.yml` are written in place into `<out-dir>/live/` (with a sibling `<out-dir>/.staging/` scratch dir). Point Traefik's file provider at `<out-dir>/live`. Rejected on upload. |
+| `--keep` | `CERTIFIC_KEEP` | download | _ignored_ | **Deprecated and ignored.** certific no longer keeps local snapshots — rollback is served by S3 object versioning. Still accepted (with a warning) so existing deploys don't fail to start. |
 | `--bucket` | `CERTIFIC_BUCKET` | both | _required_ | S3 bucket name. |
 | `--key` | `CERTIFIC_KEY` | both | `acme.json` | S3 object key. |
 | `--region` | `CERTIFIC_REGION` | both | _SDK default_ | S3 region. |
@@ -248,14 +256,16 @@ all.
   `PutObject`. Enabling S3 versioning on the bucket adds a cheap rollback
   path if a bad upload ever does land.
 - **Corrupted local file on a gateway.** The next download cycle
-  re-parses `acme.json`, renders a fresh snapshot dir, and swaps the
-  `current` symlink — both unaffected by the contents of the previous
-  snapshot. Deleting `<out-dir>/current` manually forces a re-render on
-  the next interval.
+  re-parses `acme.json` and reconciles `<out-dir>/live/` back to match
+  it — writing any missing/changed files and pruning stale ones —
+  independent of what was there before. Deleting a file under
+  `<out-dir>/live` forces certific to rewrite it on the next interval
+  (its content-compare no longer finds a match).
 - **`acme.json` parse error mid-flight.** The downloader logs the parse
   error and does not update `lastEtag`, so the next interval re-fetches
-  and re-parses. The previous `current` snapshot keeps serving in the
-  meantime; gateways never serve from a half-parsed file.
+  and re-parses. `<out-dir>/live/` is left untouched, so Traefik keeps
+  serving the last good set; gateways never serve from a half-parsed
+  file.
 
 ## Limitations
 

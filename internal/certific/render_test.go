@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -102,6 +101,9 @@ func TestParseAcmeRejectsBadBase64(t *testing.T) {
 	}
 }
 
+// liveDir is the directory Traefik watches; helper keeps the tests terse.
+func liveDir(base string) string { return filepath.Join(base, LiveDirName) }
+
 func TestRenderWritesPEMsAndTLSYAML(t *testing.T) {
 	dir := t.TempDir()
 	certs := []RenderedCert{
@@ -109,29 +111,28 @@ func TestRenderWritesPEMsAndTLSYAML(t *testing.T) {
 		{Main: "b.example", Names: []string{"b.example"}, Cert: []byte("certB"), Key: []byte("keyB")},
 	}
 
-	versionDir, _, err := Render(dir, certs, 1)
+	changed, err := Render(dir, certs)
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-
-	// versionDir should be under dir/versions/.
-	if !strings.HasPrefix(versionDir, filepath.Join(dir, "versions")) {
-		t.Errorf("versionDir = %q, expected under %q/versions", versionDir, dir)
+	if !changed {
+		t.Errorf("first render reported changed=false, want true")
 	}
 
-	// `current` resolves to versionDir via symlink.
-	resolved, err := os.Readlink(filepath.Join(dir, "current"))
+	// live/ must be a real directory, never a symlink — that's the whole
+	// point of the in-place design: Traefik's directory watch only fires
+	// on events inside a real watched dir, not on a symlink repoint.
+	info, err := os.Lstat(liveDir(dir))
 	if err != nil {
-		t.Fatalf("readlink current: %v", err)
+		t.Fatalf("lstat live: %v", err)
 	}
-	wantRel := filepath.Join("versions", filepath.Base(versionDir))
-	if resolved != wantRel {
-		t.Errorf("current -> %q, want %q (relative)", resolved, wantRel)
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("live/ is a symlink; must be a real directory")
 	}
 
 	// Both certs are written with their full PEM bytes.
 	for _, c := range certs {
-		body, err := os.ReadFile(filepath.Join(dir, "current", c.Main+".crt"))
+		body, err := os.ReadFile(filepath.Join(liveDir(dir), c.Main+".crt"))
 		if err != nil {
 			t.Fatalf("read %s.crt: %v", c.Main, err)
 		}
@@ -140,20 +141,18 @@ func TestRenderWritesPEMsAndTLSYAML(t *testing.T) {
 		}
 	}
 
-	// tls.yml lists both certs by absolute path through `current`.
-	// Bare filenames don't work — Traefik resolves relative certFile
-	// paths against its process CWD, not the directory containing the
-	// dynamic config, and silently fails with a misleading "unable to
-	// parse certificate" error. Lock in the path shape so the bug can't
-	// regress to bare filenames.
-	tlsYml, err := os.ReadFile(filepath.Join(dir, "current", "tls.yml"))
+	// tls.yml lists both certs by absolute path through live/. Bare
+	// filenames don't work — Traefik resolves relative certFile paths
+	// against its process CWD, not the directory containing the dynamic
+	// config, and silently fails with a misleading "unable to parse
+	// certificate" error. Lock in the path shape so it can't regress.
+	tlsYml, err := os.ReadFile(filepath.Join(liveDir(dir), "tls.yml"))
 	if err != nil {
 		t.Fatalf("read tls.yml: %v", err)
 	}
-	currentDir := filepath.Join(dir, "current")
 	for _, c := range certs {
-		wantCert := fmt.Sprintf("certFile: %s\n", filepath.Join(currentDir, c.Main+".crt"))
-		wantKey := fmt.Sprintf("keyFile: %s\n", filepath.Join(currentDir, c.Main+".key"))
+		wantCert := fmt.Sprintf("certFile: %s\n", filepath.Join(liveDir(dir), c.Main+".crt"))
+		wantKey := fmt.Sprintf("keyFile: %s\n", filepath.Join(liveDir(dir), c.Main+".key"))
 		if !bytes.Contains(tlsYml, []byte(wantCert)) {
 			t.Errorf("tls.yml missing absolute certFile entry %q; got:\n%s", wantCert, tlsYml)
 		}
@@ -163,22 +162,20 @@ func TestRenderWritesPEMsAndTLSYAML(t *testing.T) {
 	}
 }
 
-func TestRenderSymlinkSwapIsAtomic(t *testing.T) {
-	// Two consecutive renders with different cert content. After each
-	// one, `current` must resolve to a directory containing the
-	// expected cert. Specifically: at no point during the second render
-	// is `current` allowed to be a broken symlink or point at a
-	// half-populated dir. We approximate this by checking the
-	// post-conditions of each render.
+func TestRenderReplacesInPlace(t *testing.T) {
+	// Two consecutive renders with different cert content for the same
+	// host. The second must overwrite the cert file in live/ (in place —
+	// same path, no symlink swap) so a directory watcher sees the change.
 	dir := t.TempDir()
 
 	v1 := []RenderedCert{{Main: "x.example", Names: []string{"x.example"}, Cert: []byte("v1"), Key: []byte("k1")}}
 	v2 := []RenderedCert{{Main: "x.example", Names: []string{"x.example"}, Cert: []byte("v2"), Key: []byte("k2")}}
 
-	if _, _, err := Render(dir, v1, 1); err != nil {
+	if _, err := Render(dir, v1); err != nil {
 		t.Fatalf("Render v1: %v", err)
 	}
-	got, err := os.ReadFile(filepath.Join(dir, "current", "x.example.crt"))
+	certPath := filepath.Join(liveDir(dir), "x.example.crt")
+	got, err := os.ReadFile(certPath)
 	if err != nil {
 		t.Fatalf("read v1 cert: %v", err)
 	}
@@ -186,10 +183,10 @@ func TestRenderSymlinkSwapIsAtomic(t *testing.T) {
 		t.Errorf("after v1: got %q, want v1", got)
 	}
 
-	if _, _, err := Render(dir, v2, 1); err != nil {
+	if _, err := Render(dir, v2); err != nil {
 		t.Fatalf("Render v2: %v", err)
 	}
-	got, err = os.ReadFile(filepath.Join(dir, "current", "x.example.crt"))
+	got, err = os.ReadFile(certPath)
 	if err != nil {
 		t.Fatalf("read v2 cert: %v", err)
 	}
@@ -198,83 +195,101 @@ func TestRenderSymlinkSwapIsAtomic(t *testing.T) {
 	}
 }
 
-func TestRenderPrunesOldVersions(t *testing.T) {
-	// With Keep=1, after three distinct renders the versions/ dir
-	// should contain at most two entries (active + 1 prior).
+func TestRenderPrunesRemovedCerts(t *testing.T) {
+	// A host present in one render but gone from the next must have its
+	// .crt/.key removed from live/ — otherwise a decommissioned domain's
+	// key material lingers on every gateway indefinitely.
 	dir := t.TempDir()
 
-	renders := []RenderedCert{
-		{Main: "y.example", Names: []string{"y.example"}, Cert: []byte("a"), Key: []byte("ka")},
-		{Main: "y.example", Names: []string{"y.example"}, Cert: []byte("b"), Key: []byte("kb")},
-		{Main: "y.example", Names: []string{"y.example"}, Cert: []byte("c"), Key: []byte("kc")},
+	two := []RenderedCert{
+		{Main: "keep.example", Names: []string{"keep.example"}, Cert: []byte("kc"), Key: []byte("kk")},
+		{Main: "drop.example", Names: []string{"drop.example"}, Cert: []byte("dc"), Key: []byte("dk")},
 	}
-	for i, r := range renders {
-		// Force distinct version ids by writing a sentinel file that
-		// pads the content hash differently each iteration; without
-		// this two consecutive renders within the same wall-clock
-		// second can collide on id and short-circuit out.
-		r.Cert = append(r.Cert, byte('0'+i))
-		if _, _, err := Render(dir, []RenderedCert{r}, 1); err != nil {
-			t.Fatalf("Render[%d]: %v", i, err)
+	if _, err := Render(dir, two); err != nil {
+		t.Fatalf("Render two: %v", err)
+	}
+	// Sanity: both are present.
+	for _, name := range []string{"keep.example.crt", "drop.example.crt"} {
+		if _, err := os.Stat(filepath.Join(liveDir(dir), name)); err != nil {
+			t.Fatalf("expected %s present: %v", name, err)
 		}
 	}
 
-	entries, err := os.ReadDir(filepath.Join(dir, "versions"))
-	if err != nil {
-		t.Fatal(err)
+	one := []RenderedCert{
+		{Main: "keep.example", Names: []string{"keep.example"}, Cert: []byte("kc"), Key: []byte("kk")},
 	}
-	var dirs int
-	for _, e := range entries {
-		if e.IsDir() && filepath.Ext(e.Name()) != ".tmp" {
-			dirs++
+	changed, err := Render(dir, one)
+	if err != nil {
+		t.Fatalf("Render one: %v", err)
+	}
+	if !changed {
+		t.Errorf("dropping a cert reported changed=false, want true")
+	}
+	for _, name := range []string{"drop.example.crt", "drop.example.key"} {
+		if _, err := os.Stat(filepath.Join(liveDir(dir), name)); !os.IsNotExist(err) {
+			t.Errorf("expected %s pruned, stat err = %v", name, err)
 		}
 	}
-	if dirs > 2 {
-		t.Errorf("versions/ contains %d dirs, want ≤ 2 with Keep=1", dirs)
+	// The retained cert and the index survive.
+	if _, err := os.Stat(filepath.Join(liveDir(dir), "keep.example.crt")); err != nil {
+		t.Errorf("keep.example.crt should survive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(liveDir(dir), "tls.yml")); err != nil {
+		t.Errorf("tls.yml should survive: %v", err)
 	}
 }
 
 func TestRenderIdempotentForSameInput(t *testing.T) {
-	// Rendering the same cert list twice must produce the same version
-	// id (content-hashed) and not pile up new directories under
-	// versions/. This is what keeps the downloader cheap when an etag
-	// changes upstream but the cert material happens to be identical.
+	// Rendering the same cert list twice must be a no-op the second time:
+	// no file is rewritten, so no inotify event fires and Traefik doesn't
+	// reload. This is what keeps a re-Get with identical cert material (or
+	// the every-cycle empty re-render) from churning Traefik.
 	dir := t.TempDir()
 	certs := []RenderedCert{
 		{Main: "z.example", Names: []string{"z.example"}, Cert: []byte("same"), Key: []byte("samek")},
 	}
-	v1, _, err := Render(dir, certs, 1)
+	changed1, err := Render(dir, certs)
 	if err != nil {
 		t.Fatalf("Render 1: %v", err)
 	}
-	v2, _, err := Render(dir, certs, 1)
+	if !changed1 {
+		t.Errorf("first render changed=false, want true")
+	}
+
+	// Capture mtimes; a true no-op must not touch any file.
+	before := fileMTimes(t, liveDir(dir))
+
+	changed2, err := Render(dir, certs)
 	if err != nil {
 		t.Fatalf("Render 2: %v", err)
 	}
-	// Version ids include a timestamp prefix, so consecutive renders
-	// inside the same second produce different ids. To pin "same input
-	// ⇒ same id" specifically we'd need to inject a clock; instead we
-	// settle for the weaker invariant that the second render is a
-	// no-op directory-wise when the dir already exists.
-	_ = v1
-	_ = v2
-
-	entries, err := os.ReadDir(filepath.Join(dir, "versions"))
-	if err != nil {
-		t.Fatal(err)
+	if changed2 {
+		t.Errorf("second identical render changed=true, want false (no-op)")
 	}
-	// Either both renders produced the same id (1 dir) or different
-	// timestamps produced two (2 dirs, with Keep=1 the older is kept
-	// because it's the prior-to-active). Anything more is a bug.
-	var dirs int
-	for _, e := range entries {
-		if e.IsDir() && filepath.Ext(e.Name()) != ".tmp" {
-			dirs++
+	after := fileMTimes(t, liveDir(dir))
+
+	for name, mt := range before {
+		if after[name] != mt {
+			t.Errorf("%s was rewritten on an identical render (mtime changed)", name)
 		}
 	}
-	if dirs > 2 {
-		t.Errorf("versions/ contains %d dirs, want ≤ 2", dirs)
+}
+
+func fileMTimes(t *testing.T, dir string) map[string]int64 {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir %s: %v", dir, err)
 	}
+	out := make(map[string]int64, len(ents))
+	for _, e := range ents {
+		info, err := e.Info()
+		if err != nil {
+			t.Fatalf("info %s: %v", e.Name(), err)
+		}
+		out[e.Name()] = info.ModTime().UnixNano()
+	}
+	return out
 }
 
 func TestRenderEmptyCertsProducesEmptyTLSConfig(t *testing.T) {
@@ -282,15 +297,36 @@ func TestRenderEmptyCertsProducesEmptyTLSConfig(t *testing.T) {
 	// any issuance). The renderer must still produce a valid tls.yml
 	// so Traefik's file provider doesn't complain about a missing file.
 	dir := t.TempDir()
-	if _, _, err := Render(dir, nil, 1); err != nil {
+	if _, err := Render(dir, nil); err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-	body, err := os.ReadFile(filepath.Join(dir, "current", "tls.yml"))
+	body, err := os.ReadFile(filepath.Join(liveDir(dir), "tls.yml"))
 	if err != nil {
 		t.Fatalf("read tls.yml: %v", err)
 	}
 	if !bytes.Contains(body, []byte("certificates: []")) {
 		t.Errorf("expected empty certs list, got: %s", body)
+	}
+}
+
+func TestRenderLeavesNoStagingResidue(t *testing.T) {
+	// The staging dir must never leak temp files: they'd accumulate, and
+	// a leftover .tmp under a watched dir would trip Traefik. .staging is
+	// a sibling of live/, so it's never watched, but it must still be
+	// clean after a successful render.
+	dir := t.TempDir()
+	certs := []RenderedCert{
+		{Main: "s.example", Names: []string{"s.example"}, Cert: []byte("c"), Key: []byte("k")},
+	}
+	if _, err := Render(dir, certs); err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	ents, err := os.ReadDir(filepath.Join(dir, stagingDirName))
+	if err != nil {
+		t.Fatalf("read staging: %v", err)
+	}
+	if len(ents) != 0 {
+		t.Errorf("staging dir not empty after render: %d entries", len(ents))
 	}
 }
 
