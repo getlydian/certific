@@ -171,7 +171,6 @@ upload and download sidecars.
 | `--mode` | `CERTIFIC_MODE` | both | _required_ | `upload` or `download`. |
 | `--path` | `CERTIFIC_PATH` | upload | _required_ | Local path to the issuer's `acme.json`. Rejected on download. |
 | `--out-dir` | `CERTIFIC_OUT_DIR` | download | _required_ | Output directory. Cert PEMs and `tls.yml` are written in place into `<out-dir>/live/` (with a sibling `<out-dir>/.staging/` scratch dir). Point Traefik's file provider at `<out-dir>/live`. Rejected on upload. |
-| `--keep` | `CERTIFIC_KEEP` | download | _ignored_ | **Deprecated and ignored.** certific no longer keeps local snapshots — rollback is served by S3 object versioning. Still accepted (with a warning) so existing deploys don't fail to start. |
 | `--bucket` | `CERTIFIC_BUCKET` | both | _required_ | S3 bucket name. |
 | `--key` | `CERTIFIC_KEY` | both | `acme.json` | S3 object key. |
 | `--region` | `CERTIFIC_REGION` | both | _SDK default_ | S3 region. |

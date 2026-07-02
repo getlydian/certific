@@ -177,25 +177,16 @@ func TestLoadConfigOutDirRejectedOnUpload(t *testing.T) {
 	}
 }
 
-// TestLoadConfigKeepFlag pins the parse path for --keep, the
-// snapshot-retention knob used by download mode's prune step.
-func TestLoadConfigKeepFlag(t *testing.T) {
+// TestLoadConfigKeepRemoved pins that --keep is gone: it used to retain
+// versioned snapshots, but the downloader now writes cert material in
+// place into <out-dir>/live/ and keeps no local history (rollback is
+// served by S3 object versioning). The flag is no longer defined, so the
+// flag parser rejects it as unknown in either mode.
+func TestLoadConfigKeepRemoved(t *testing.T) {
 	args := append(baseDownloadArgs(), "--keep", "5")
-	cfg, err := LoadConfig(args, nil, io.Discard)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if cfg.Keep != 5 {
-		t.Errorf("Keep = %d, want 5", cfg.Keep)
-	}
-}
-
-// TestLoadConfigKeepRejectedOnUpload: --keep is download-only.
-func TestLoadConfigKeepRejectedOnUpload(t *testing.T) {
-	args := append(baseUploadArgs(), "--keep", "5")
 	_, err := LoadConfig(args, nil, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "--keep") {
-		t.Fatalf("err = %v, want --keep rejected on upload", err)
+	if err == nil || !strings.Contains(err.Error(), "keep") {
+		t.Fatalf("err = %v, want --keep rejected as an unknown flag", err)
 	}
 }
 

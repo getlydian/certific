@@ -57,7 +57,6 @@ type Config struct {
 	Mode        Mode
 	Path        string // upload mode: input acme.json file
 	OutDir      string // download mode: output dir for rendered cert PEMs + tls.yml (written into <OutDir>/live)
-	Keep        int    // download mode: DEPRECATED, ignored — no local snapshots are kept
 	Bucket      string
 	Key         string
 	Region      string
@@ -87,12 +86,6 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 		Endpoint:   envOr(env, "CERTIFIC_ENDPOINT", ""),
 		HealthAddr: envOr(env, "CERTIFIC_HEALTH_ADDR", ""),
 	}
-	if k, err := envInt(env, "CERTIFIC_KEEP", 0); err != nil {
-		return Config{}, err
-	} else {
-		cfg.Keep = k
-	}
-
 	var err error
 	if cfg.Interval, err = envDuration(env, "CERTIFIC_INTERVAL", DefaultInterval); err != nil {
 		return Config{}, err
@@ -111,7 +104,6 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 	fs.StringVar(&modeStr, "mode", modeStr, "run mode: upload|download (CERTIFIC_MODE)")
 	fs.StringVar(&cfg.Path, "path", cfg.Path, "upload mode: local acme.json path (CERTIFIC_PATH)")
 	fs.StringVar(&cfg.OutDir, "out-dir", cfg.OutDir, "download mode: output dir for rendered cert PEMs + tls.yml; gateway Traefik points its file provider at <out-dir>/live (CERTIFIC_OUT_DIR)")
-	keepFlag := fs.String("keep", "", "download mode: DEPRECATED and ignored — certific no longer keeps local snapshots (CERTIFIC_KEEP)")
 	fs.StringVar(&cfg.Bucket, "bucket", cfg.Bucket, "S3 bucket name (CERTIFIC_BUCKET)")
 	fs.StringVar(&cfg.Key, "key", cfg.Key, "S3 object key (CERTIFIC_KEY)")
 	fs.StringVar(&cfg.Region, "region", cfg.Region, "S3 region (CERTIFIC_REGION)")
@@ -138,15 +130,6 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 		cfg.Interval = d
 	}
 
-	keepFromFlag := *keepFlag != ""
-	if keepFromFlag {
-		n, err := strconv.Atoi(*keepFlag)
-		if err != nil {
-			return Config{}, fmt.Errorf("--keep: %w", err)
-		}
-		cfg.Keep = n
-	}
-
 	healthGraceFromFlag := *healthGraceFlag != ""
 	if healthGraceFromFlag {
 		d, err := time.ParseDuration(*healthGraceFlag)
@@ -160,7 +143,7 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 		return Config{}, err
 	}
 
-	if err := cfg.validate(intervalFromFlag, healthGraceFromFlag, keepFromFlag); err != nil {
+	if err := cfg.validate(intervalFromFlag, healthGraceFromFlag); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -172,7 +155,7 @@ func LoadConfig(args []string, environ []string, stderr io.Writer) (Config, erro
 // line, since env vs. flag have different rejection semantics (env is
 // ignored for non-applicable modes; flags are rejected loudly to make
 // misconfigurations obvious).
-func (c *Config) validate(intervalFromFlag, healthGraceFromFlag, keepFromFlag bool) error {
+func (c *Config) validate(intervalFromFlag, healthGraceFromFlag bool) error {
 	switch c.Mode {
 	case "":
 		return fmt.Errorf("--mode is required (upload|download)")
@@ -216,9 +199,6 @@ func (c *Config) validate(intervalFromFlag, healthGraceFromFlag, keepFromFlag bo
 	if c.Mode == ModeUpload && intervalFromFlag {
 		return fmt.Errorf("--interval is only valid in download mode")
 	}
-	if c.Mode == ModeUpload && keepFromFlag {
-		return fmt.Errorf("--keep is only valid in download mode")
-	}
 
 	if c.Mode == ModeDownload {
 		if c.Interval < MinInterval || c.Interval > MaxInterval {
@@ -232,11 +212,10 @@ func (c *Config) validate(intervalFromFlag, healthGraceFromFlag, keepFromFlag bo
 		}
 		c.HealthGrace = 0
 	} else {
-		// Upload mode doesn't use Interval/Keep; zero them so accidental
-		// reads downstream produce an obvious zero value rather than a
-		// stale default.
+		// Upload mode doesn't use Interval; zero it so accidental reads
+		// downstream produce an obvious zero value rather than a stale
+		// default.
 		c.Interval = 0
-		c.Keep = 0
 		if c.HealthGrace <= 0 {
 			return fmt.Errorf("--health-grace must be > 0, got %s", c.HealthGrace)
 		}
