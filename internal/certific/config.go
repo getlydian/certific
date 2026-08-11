@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -241,18 +240,6 @@ func envOr(env map[string]string, key, def string) string {
 		return v
 	}
 	return def
-}
-
-func envInt(env map[string]string, key string, def int) (int, error) {
-	v, ok := env[key]
-	if !ok || v == "" {
-		return def, nil
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return 0, fmt.Errorf("%s: %w", key, err)
-	}
-	return n, nil
 }
 
 func envDuration(env map[string]string, key string, def time.Duration) (time.Duration, error) {
